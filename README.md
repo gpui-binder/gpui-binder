@@ -274,7 +274,7 @@ The workflow creates:
 ```text
 crates/gpui_facade/Cargo.toml
 crates/gpui_facade/README.md
-crates/gpui_facade/src/main.rs
+crates/gpui_facade/src/lib.rs
 ```
 
 The facade crate re-exports GPUI and selected related crates so downstream crates can depend on one facade package.
@@ -1014,7 +1014,7 @@ Inspect the generated facade crate:
 
 ```bash
 cat crates/gpui_facade/Cargo.toml
-cat crates/gpui_facade/src/main.rs
+cat crates/gpui_facade/src/lib.rs
 ```
 
 Inspect the imported component crate:
