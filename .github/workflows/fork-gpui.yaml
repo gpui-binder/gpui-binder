@@ -512,6 +512,8 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
+            libpango1.0-dev \
+            libcairo2-dev \
             pkg-config \
             libfontconfig1-dev \
             libxkbcommon-dev \

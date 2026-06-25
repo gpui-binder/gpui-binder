@@ -48,6 +48,8 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
+            libpango1.0-dev \
+            libcairo2-dev \
             build-essential \
             pkg-config \
             libglib2.0-dev \
