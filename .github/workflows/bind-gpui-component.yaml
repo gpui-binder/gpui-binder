@@ -281,7 +281,7 @@ jobs:
           selected_source_dirs = {Path(item["source"]).resolve() for item in crates.values()}
 
           def make_ignore(source_root: Path):
-              fixed_ignore = shutil.ignore_patterns(".git", "target", ".DS_Store")
+              fixed_ignore = shutil.ignore_patterns(".git", "target", ".DS_Store", "__MACOSX", "__MACOSX", "Thumbs.db", "desktop.ini", ".claude", ".codex", "AGENTS.md", "CLAUDE.md", "GEMINI.md")
 
               def ignore(current_dir, names):
                   ignored = set(fixed_ignore(current_dir, names))
@@ -304,6 +304,33 @@ jobs:
               shutil.copytree(source, target, ignore=make_ignore(source))
 
               print(f"Imported {package}: {source} -> {target}")
+
+      - name: Import source support files used by compile-time includes
+        shell: python
+        run: |
+          from pathlib import Path
+          import shutil
+
+          source_root = Path("_gpui_component_source")
+
+          # gpui-component currently uses include_str!("../../../../themes/...")
+          # from crates/gpui_component/src/theme, which resolves to repo-root/themes.
+          # The package graph import copies only Cargo packages, so copy this
+          # non-package support directory explicitly.
+          support_dirs = ["themes"]
+
+          for rel in support_dirs:
+              source = source_root / rel
+              target = Path(rel)
+              if not source.exists():
+                  print(f"Source support path not found, skipping: {source}")
+                  continue
+
+              if target.exists():
+                  shutil.rmtree(target)
+
+              shutil.copytree(source, target, ignore=shutil.ignore_patterns(".git", "target", ".DS_Store", "__MACOSX", "Thumbs.db", "desktop.ini", ".claude", ".codex", "AGENTS.md", "CLAUDE.md", "GEMINI.md"))
+              print(f"Imported source support directory {source} -> {target}")
 
       - name: Patch root workspace Cargo.toml
         env:
@@ -450,6 +477,12 @@ jobs:
               parse_dependency_entries(extract_section(root_text, "workspace.dependencies")).keys()
           )
 
+          # Some source dependencies intentionally need the source repo's version,
+          # even when Zed has a workspace dependency with the same name.
+          # gpui-component's LSP code currently uses APIs from lsp-types 0.97;
+          # Zed's workspace lsp-types is older/different and breaks these files.
+          preserve_source_workspace_deps = {"lsp-types"}
+
           local_packages = {}
           for cargo_toml in Path("crates").glob("*/Cargo.toml"):
               try:
@@ -520,7 +553,9 @@ jobs:
                   original = text
 
                   for dep_name, source_entry in source_deps.items():
-                      if dep_name in imported_packages or dep_name in target_workspace_deps:
+                      if dep_name in imported_packages:
+                          continue
+                      if dep_name in target_workspace_deps and dep_name not in preserve_source_workspace_deps:
                           continue
                       replacement = rewrite_zed_git_dependency_to_local_for_manifest(
                           source_entry,
