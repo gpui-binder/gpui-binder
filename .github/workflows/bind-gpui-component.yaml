@@ -36,6 +36,10 @@ jobs:
     name: Import gpui-component into Zed workspace
     runs-on: ubuntu-latest
 
+    env:
+      TARGET_BRANCH: ${{ inputs.target_branch }}
+      SOURCE_ROOT_PACKAGE: ${{ inputs.source_root_package }}
+
     steps:
       - name: Checkout zed fork
         uses: actions/checkout@v4
@@ -55,7 +59,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git checkout -B "${{ inputs.target_branch }}"
+          git checkout -B "${TARGET_BRANCH}"
 
       - name: Checkout gpui-component source
         uses: actions/checkout@v4
@@ -76,7 +80,7 @@ jobs:
           import tomllib
 
           src = Path("_gpui_component_source").resolve()
-          root_package = "${{ inputs.source_root_package }}".strip()
+          root_package = os.environ["SOURCE_ROOT_PACKAGE"].strip()
 
           def ignored(path: Path) -> bool:
               return any(part in {".git", "target"} for part in path.parts)
@@ -223,13 +227,16 @@ jobs:
           print(json.dumps(found, indent=2, sort_keys=True))
 
       - name: Import discovered packages into zed/crates
+        env:
+          CRATES_JSON: ${{ steps.detect.outputs.crates_json }}
         shell: python
         run: |
           from pathlib import Path
           import json
+          import os
           import shutil
 
-          crates = json.loads(r'''${{ steps.detect.outputs.crates_json }}''')
+          crates = json.loads(os.environ["CRATES_JSON"])
 
           Path("crates").mkdir(exist_ok=True)
 
@@ -261,13 +268,16 @@ jobs:
               print(f"Imported {package}: {source} -> {target}")
 
       - name: Patch root workspace Cargo.toml
+        env:
+          CRATES_JSON: ${{ steps.detect.outputs.crates_json }}
         shell: python
         run: |
           from pathlib import Path
           import json
+          import os
           import re
 
-          crates = json.loads(r'''${{ steps.detect.outputs.crates_json }}''')
+          crates = json.loads(os.environ["CRATES_JSON"])
 
           root = Path("Cargo.toml")
           text = root.read_text()
@@ -336,6 +346,8 @@ jobs:
           root.write_text(text)
 
       - name: Expand missing source workspace dependencies locally
+        env:
+          CRATES_JSON: ${{ steps.detect.outputs.crates_json }}
         shell: python
         run: |
           from pathlib import Path
@@ -344,7 +356,7 @@ jobs:
           import re
           import tomllib
 
-          crates = json.loads(r'''${{ steps.detect.outputs.crates_json }}''')
+          crates = json.loads(os.environ["CRATES_JSON"])
           imported_packages = set(crates.keys())
 
           source_root = Path("_gpui_component_source/Cargo.toml")
@@ -483,13 +495,16 @@ jobs:
                       print(f"Expanded source workspace dependencies in {cargo_toml}")
 
       - name: Remove nested workspace metadata from imported packages
+        env:
+          CRATES_JSON: ${{ steps.detect.outputs.crates_json }}
         shell: python
         run: |
           from pathlib import Path
           import json
+          import os
           import re
 
-          crates = json.loads(r'''${{ steps.detect.outputs.crates_json }}''')
+          crates = json.loads(os.environ["CRATES_JSON"])
 
           for item in crates.values():
               target = Path(item["target"])
@@ -505,13 +520,16 @@ jobs:
                       print(f"Removed nested workspace metadata from {toml}")
 
       - name: Patch imported local package dependencies to workspace dependencies
+        env:
+          CRATES_JSON: ${{ steps.detect.outputs.crates_json }}
         shell: python
         run: |
           from pathlib import Path
           import json
+          import os
           import re
 
-          crates = json.loads(r'''${{ steps.detect.outputs.crates_json }}''')
+          crates = json.loads(os.environ["CRATES_JSON"])
           imported_packages = set(crates.keys())
 
           def rewrite_inline_table(dep_name: str, body: str) -> str:
@@ -562,13 +580,16 @@ jobs:
                       patch_dependency_to_workspace(cargo_toml, package)
 
       - name: Force imported packages to use local gpui_facade package
+        env:
+          CRATES_JSON: ${{ steps.detect.outputs.crates_json }}
         shell: python
         run: |
           from pathlib import Path
           import json
+          import os
           import re
 
-          crates = json.loads(r'''${{ steps.detect.outputs.crates_json }}''')
+          crates = json.loads(os.environ["CRATES_JSON"])
           replacement = 'gpui = { package = "gpui_facade", path = "../gpui_facade", features = ["gpui_macos", "gpui_web", "gpui_macros", "font-kit", "x11", "wayland", "runtime_shaders"] }'
 
           def force_gpui(cargo_toml: Path):
@@ -601,13 +622,16 @@ jobs:
                   force_gpui(cargo_toml)
 
       - name: Apply gpui-unofficial-style modifications
+        env:
+          CRATES_JSON: ${{ steps.detect.outputs.crates_json }}
         shell: python
         run: |
           from pathlib import Path
           import json
+          import os
           import re
 
-          crates = json.loads(r'''${{ steps.detect.outputs.crates_json }}''')
+          crates = json.loads(os.environ["CRATES_JSON"])
 
           imported_roots = [
               Path(item["target"])
@@ -696,7 +720,8 @@ jobs:
             echo "Imported packages:"
             python - <<'PY'
           import json
-          crates = json.loads(r'''${{ steps.detect.outputs.crates_json }}''')
+          import os
+          crates = json.loads(os.environ["CRATES_JSON"])
           for package, item in sorted(crates.items()):
               print(f"- {package}: {item['target']}")
           PY
@@ -704,13 +729,16 @@ jobs:
 
       - name: Commit generated branch
         id: generated_commit
+        env:
+          IMPORTED_PATHS_JSON: ${{ steps.detect.outputs.imported_paths_json }}
         shell: bash
         run: |
           set -euo pipefail
 
           mapfile -t IMPORTED_PATHS < <(python - <<'PY'
           import json
-          for path in json.loads(r'''${{ steps.detect.outputs.imported_paths_json }}'''):
+          import os
+          for path in json.loads(os.environ["IMPORTED_PATHS_JSON"]):
               print(path)
           PY
           )
@@ -734,7 +762,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          TARGET_BRANCH="${{ inputs.target_branch }}"
+          TARGET_BRANCH="${TARGET_BRANCH}"
           REMOTE_GENERATED_BRANCH="__remote_generated_tree_for_compare"
 
           if git ls-remote --exit-code --heads origin "$TARGET_BRANCH" >/dev/null 2>&1; then

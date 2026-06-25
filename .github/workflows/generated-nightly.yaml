@@ -263,6 +263,8 @@ jobs:
       - name: Summary
         if: always()
         shell: bash
+        env:
+          PRE_README_COMMIT_OUTPUT: ${{ steps.readme.outputs.pre_readme_commit }}
         run: |
           set -euo pipefail
 
@@ -278,5 +280,5 @@ jobs:
             echo ""
             echo "Schedule: daily at 17:42 GMT+9 / 08:42 UTC"
             echo ""
-            echo "Usage revision: \`${{ steps.readme.outputs.pre_readme_commit }}\`"
+            echo "Usage revision: \`${PRE_README_COMMIT_OUTPUT}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
