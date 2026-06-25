@@ -512,9 +512,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential \
             pkg-config \
-            libglib2.0-dev \
             libfontconfig1-dev \
             libxkbcommon-dev \
             libwayland-dev \
@@ -679,10 +677,10 @@ jobs:
             echo "Using sparse checkout directly as output directory"
           }
 
-          capture_downloaded_file_mtimes() {
-            local snapshot_path="$RUNNER_TEMP/downloaded-file-mtimes.tsv"
+          capture_upstream_file_dates_from_git() {
+            local snapshot_path="$RUNNER_TEMP/upstream-file-dates.tsv"
 
-            echo "Capturing downloaded file modified times before workflow rewrites"
+            echo "Capturing upstream file dates from Git commit history"
 
             cd "$OUT_DIR"
 
@@ -690,26 +688,92 @@ jobs:
           from datetime import datetime
           from pathlib import Path
           from zoneinfo import ZoneInfo
+          import subprocess
           import sys
 
           root = Path(sys.argv[1]).resolve()
           snapshot = Path(sys.argv[2]).resolve()
           denver = ZoneInfo("America/Denver")
+          batch_size = 128
 
-          rows = []
-          for path in root.rglob("*"):
-              if not path.is_file():
-                  continue
+          def denver_date(iso: str) -> str:
+              # Git %cI is strict ISO-8601, usually with an explicit numeric offset.
+              return datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(denver).date().isoformat()
 
-              rel = path.relative_to(root).as_posix()
-              if rel.startswith(".git/"):
-                  continue
+          raw = subprocess.run(
+              ["git", "-C", str(root), "ls-files", "-z"],
+              check=True,
+              stdout=subprocess.PIPE,
+          ).stdout
 
-              date = datetime.fromtimestamp(path.stat().st_mtime, denver).date().isoformat()
-              rows.append((rel, date))
+          files = [item for item in raw.decode("utf-8", "surrogateescape").split("\0") if item]
+          files = [rel for rel in files if (root / rel).is_file()]
+
+          dates = {}
+
+          for offset in range(0, len(files), batch_size):
+              batch = files[offset:offset + batch_size]
+              wanted = set(batch)
+              current_date = None
+
+              proc = subprocess.Popen(
+                  [
+                      "git",
+                      "-C",
+                      str(root),
+                      "log",
+                      "--format=@@%cI",
+                      "--name-only",
+                      "--",
+                      *batch,
+                  ],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  text=True,
+                  encoding="utf-8",
+                  errors="surrogateescape",
+              )
+
+              assert proc.stdout is not None
+              for line in proc.stdout:
+                  line = line.rstrip("\n")
+
+                  if line.startswith("@@"):
+                      current_date = denver_date(line[2:])
+                      continue
+
+                  rel = line.strip()
+                  if not rel or current_date is None:
+                      continue
+
+                  if rel in wanted and rel not in dates:
+                      dates[rel] = current_date
+                      wanted.remove(rel)
+
+                      # Stop this batch as soon as every file has a latest commit date.
+                      # This avoids walking old history unnecessarily.
+                      if not wanted:
+                          proc.terminate()
+                          break
+
+              try:
+                  proc.wait(timeout=10)
+              except subprocess.TimeoutExpired:
+                  proc.kill()
+                  proc.wait()
+
+              if proc.returncode not in (0, -15, 143):
+                  stderr = proc.stderr.read() if proc.stderr is not None else ""
+                  raise SystemExit(f"git log failed while collecting file dates:\n{stderr}")
+
+          # Fallback should be rare, but keeps generated output robust if a sparse-checkout
+          # edge case leaves a file present but not tracked by Git.
+          for rel in files:
+              if rel not in dates:
+                  dates[rel] = datetime.fromtimestamp((root / rel).stat().st_mtime, denver).date().isoformat()
 
           snapshot.write_text(
-              "".join(f"{rel}\t{date}\n" for rel, date in sorted(rows)),
+              "".join(f"{rel}\t{dates[rel]}\n" for rel in sorted(dates)),
               encoding="utf-8",
           )
           PY
@@ -799,14 +863,14 @@ jobs:
           }
 
           generate_files_by_date_markdown() {
-            local mtime_snapshot_path="$1"
+            local date_snapshot_path="$1"
             local output_path="$OUT_DIR/FILES-BY-DATE-ZED.md"
 
             echo "Generating: FILES-BY-DATE-ZED.md"
 
             cd "$OUT_DIR"
 
-            python3 - "$OUT_DIR" "$output_path" "$mtime_snapshot_path" <<'PY'
+            python3 - "$OUT_DIR" "$output_path" "$date_snapshot_path" <<'PY'
           from collections import defaultdict
           from datetime import datetime
           from pathlib import Path
@@ -815,19 +879,19 @@ jobs:
 
           output_root = Path(sys.argv[1]).resolve()
           output_path = Path(sys.argv[2]).resolve()
-          mtime_snapshot_path = Path(sys.argv[3]).resolve()
+          date_snapshot_path = Path(sys.argv[3]).resolve()
           denver = ZoneInfo("America/Denver")
 
-          downloaded_dates = {}
-          if mtime_snapshot_path.exists():
-              for line in mtime_snapshot_path.read_text(encoding="utf-8").splitlines():
+          source_dates = {}
+          if date_snapshot_path.exists():
+              for line in date_snapshot_path.read_text(encoding="utf-8").splitlines():
                   if not line.strip():
                       continue
                   try:
                       rel, date = line.split("	", 1)
                   except ValueError:
                       continue
-                  downloaded_dates[rel] = date
+                  source_dates[rel] = date
 
           # Hard-coded exclusions for FILES-BY-DATE-ZED.md.
           # These files are generated, rewritten, renamed, or intentionally omitted
@@ -842,15 +906,15 @@ jobs:
               "crates/gpui_facade/src/lib.rs",
           }
 
-          def filesystem_date(path: Path, rel: str) -> str:
-              # Prefer the mtime captured immediately after upstream checkout/download.
-              # Later workflow steps intentionally rewrite/generate files and can otherwise
-              # make source files appear to have today's date.
-              snapshot_date = downloaded_dates.get(rel)
+          def source_date(path: Path, rel: str) -> str:
+              # Prefer the upstream Git commit date captured before workflow rewrites.
+              # Filesystem mtimes from git checkout are normally checkout-time, so they
+              # cannot be used as historical source-file dates.
+              snapshot_date = source_dates.get(rel)
               if snapshot_date:
                   return snapshot_date
 
-              # Fallback for files that did not exist in the downloaded tree.
+              # Fallback for generated or untracked files that are not excluded above.
               return datetime.fromtimestamp(path.stat().st_mtime, denver).date().isoformat()
 
           groups = defaultdict(list)
@@ -868,7 +932,7 @@ jobs:
               if rel in manifest_excludes:
                   continue
 
-              groups[filesystem_date(path, rel)].append(rel)
+              groups[source_date(path, rel)].append(rel)
 
           lines = [
               "# Files by date changed in Zed",
@@ -877,7 +941,7 @@ jobs:
               "",
               "Dates are grouped using the Denver, Colorado timezone (America/Denver).",
               "",
-              "Dates come from each file's filesystem modified time captured immediately after upstream checkout/download, before workflow rewrites.",
+              "Dates come from the latest upstream Git commit that changed each tracked file, grouped in the Denver timezone.",
               "Generated or rewritten files excluded from this manifest are intentionally omitted.",
               "",
           ]
@@ -1263,7 +1327,7 @@ jobs:
 
           copy_sparse_source_to_output
 
-          DOWNLOADED_MTIME_SNAPSHOT="$(capture_downloaded_file_mtimes)"
+          UPSTREAM_DATE_SNAPSHOT="$(capture_upstream_file_dates_from_git)"
 
           remove_materialized_exclusions "$OUT_DIR"
 
@@ -1281,7 +1345,7 @@ jobs:
 
           amend_root_cargo_toml_for_workspace
 
-          generate_files_by_date_markdown "$DOWNLOADED_MTIME_SNAPSHOT"
+          generate_files_by_date_markdown "$UPSTREAM_DATE_SNAPSHOT"
 
           if [ "${DEBUG_LOGS_INPUT}" = "true" ]; then
             echo "Final output tree root:"
