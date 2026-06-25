@@ -29,11 +29,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
+    env:
+      CHECK_REF: ${{ inputs.ref }}
+
     steps:
       - name: Checkout selected ref
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ env.CHECK_REF }}
           fetch-depth: 1
 
       - name: Show checked ref
@@ -41,7 +44,7 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          echo "Requested ref: ${{ inputs.ref }}"
+          echo "Requested ref: ${CHECK_REF}"
           echo "Checked out commit: $(git rev-parse HEAD)"
           echo
           git status --short --branch

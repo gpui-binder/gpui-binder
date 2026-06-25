@@ -6,7 +6,7 @@ name: Import gpui-component
       zed_ref:
         description: "Branch, tag, or SHA of this zed fork to use as the base"
         required: true
-        default: "main"
+        default: "generated-gpui-base-evaluate"
 
       source_repo:
         description: "Repository to import from"
@@ -18,10 +18,15 @@ name: Import gpui-component
         required: true
         default: "main"
 
+      source_root_package:
+        description: "Root package to import; packages named root-package-* are imported too"
+        required: true
+        default: "gpui-component"
+
       target_branch:
         description: "Branch to create/update with the generated import"
         required: true
-        default: "generated"
+        default: "generated-gpui-binded-evaluate"
 
 permissions:
   contents: write
@@ -31,7 +36,49 @@ jobs:
     name: Import gpui-component into Zed workspace
     runs-on: ubuntu-latest
 
+    env:
+      TARGET_BRANCH: ${{ inputs.target_branch }}
+      SOURCE_ROOT_PACKAGE: ${{ inputs.source_root_package }}
+      CARGO_TARGET_DIR: /tmp/cargo-target
+
     steps:
+      - name: Install Linux cargo dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libgtk-3-dev \
+            libgdk-pixbuf-2.0-dev \
+            libatk1.0-dev \
+            libpango1.0-dev \
+            libcairo2-dev \
+            libglib2.0-dev \
+            libfontconfig1-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libssl-dev
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            /tmp/cargo-target
+          key: cargo-${{ runner.os }}-${{ inputs.zed_ref }}-${{ inputs.source_repo }}-${{ inputs.source_ref }}-bind-gpui-component-v1
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ inputs.zed_ref }}-${{ inputs.source_repo }}-
+            cargo-${{ runner.os }}-${{ inputs.zed_ref }}-
+            cargo-${{ runner.os }}-
+
       - name: Checkout zed fork
         uses: actions/checkout@v4
         with:
@@ -50,7 +97,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git checkout -B "${{ inputs.target_branch }}"
+          git checkout -B "${TARGET_BRANCH}"
 
       - name: Checkout gpui-component source
         uses: actions/checkout@v4
@@ -60,67 +107,192 @@ jobs:
           path: _gpui_component_source
           fetch-depth: 1
 
-      - name: Detect source crates
+      - name: Discover source package graph
         id: detect
         shell: python
         run: |
           from pathlib import Path
-          import tomllib
           import json
           import os
+          import re
+          import tomllib
 
-          src = Path("_gpui_component_source")
+          src = Path("_gpui_component_source").resolve()
+          root_package = os.environ["SOURCE_ROOT_PACKAGE"].strip()
 
-          package_to_target = {
-              "gpui-component": "crates/gpui_component",
-              "gpui-component-assets": "crates/gpui_component_assets",
-              "gpui-component-macros": "crates/gpui_component_macros",
-              "gpui-component-story": "crates/gpui_component_story",
-              "gpui-component-story-web": "crates/gpui_component_story_web",
+          def ignored(path: Path) -> bool:
+              return any(part in {".git", "target"} for part in path.parts)
+
+          def read_toml(path: Path):
+              try:
+                  return tomllib.loads(path.read_text())
+              except Exception as exc:
+                  print(f"Skipping unreadable TOML {path}: {exc}")
+                  return None
+
+          def package_target_path(package_name: str) -> str:
+              safe = re.sub(r"[^A-Za-z0-9_]+", "_", package_name).strip("_")
+              if not safe:
+                  raise SystemExit(f"Cannot derive target path for package {package_name!r}")
+              return f"crates/{safe}"
+
+          def iter_dependency_items(data):
+              for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+                  table = data.get(section, {})
+                  if isinstance(table, dict):
+                      yield from table.items()
+
+              target = data.get("target", {})
+              if isinstance(target, dict):
+                  for target_table in target.values():
+                      if not isinstance(target_table, dict):
+                          continue
+                      for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+                          table = target_table.get(section, {})
+                          if isinstance(table, dict):
+                              yield from table.items()
+
+          def dep_package_name(dep_name: str, dep_value) -> str:
+              if isinstance(dep_value, dict) and isinstance(dep_value.get("package"), str):
+                  return dep_value["package"]
+              return dep_name
+
+          def dep_path(dep_value):
+              if isinstance(dep_value, dict) and isinstance(dep_value.get("path"), str):
+                  return dep_value["path"]
+              return None
+
+          source_root_manifest = src / "Cargo.toml"
+          source_root_data = read_toml(source_root_manifest) or {}
+          source_workspace_deps = source_root_data.get("workspace", {}).get("dependencies", {})
+          if not isinstance(source_workspace_deps, dict):
+              source_workspace_deps = {}
+
+          packages = {}
+          manifests_by_dir = {}
+          for cargo_toml in src.rglob("Cargo.toml"):
+              if ignored(cargo_toml.relative_to(src)):
+                  continue
+
+              data = read_toml(cargo_toml)
+              if not data:
+                  continue
+
+              package = data.get("package", {})
+              name = package.get("name") if isinstance(package, dict) else None
+              if not name:
+                  continue
+
+              rel_manifest = cargo_toml.relative_to(src)
+              if name in packages:
+                  raise SystemExit(
+                      f"Duplicate source package name {name!r}: "
+                      f"{packages[name]['manifest']} and {rel_manifest}"
+                  )
+
+              packages[name] = {
+                  "name": name,
+                  "source": str(cargo_toml.parent.relative_to(src)),
+                  "manifest": str(rel_manifest),
+                  "target": package_target_path(name),
+                  "data": data,
+              }
+              manifests_by_dir[cargo_toml.parent.resolve()] = name
+
+          initial = sorted(
+              name for name in packages
+              if name == root_package or name.startswith(root_package + "-")
+          )
+
+          if not initial:
+              print(f"Could not find package {root_package!r} or {root_package!r}-* in source repo.")
+              print("Packages found:")
+              for name in sorted(packages):
+                  print(f"  {name}: {packages[name]['manifest']}")
+              raise SystemExit(1)
+
+          selected = set()
+          queue = list(initial)
+
+          while queue:
+              name = queue.pop(0)
+              if name in selected:
+                  continue
+              selected.add(name)
+
+              item = packages[name]
+              manifest_dir = src / item["source"]
+              data = item["data"]
+
+              for dep_name, dep_value in iter_dependency_items(data):
+                  effective_value = dep_value
+                  if isinstance(dep_value, dict) and dep_value.get("workspace") is True:
+                      effective_value = source_workspace_deps.get(dep_name, dep_value)
+
+                  local_dep_name = None
+                  local_path = dep_path(effective_value)
+                  if local_path:
+                      candidate = (manifest_dir / local_path).resolve() / "Cargo.toml"
+                      local_dep_name = manifests_by_dir.get(candidate.parent)
+
+                  package_name = dep_package_name(dep_name, effective_value)
+                  if not local_dep_name and package_name in packages:
+                      # Some source manifests reference a sibling workspace package through
+                      # a workspace dependency or package alias rather than direct path.
+                      local_dep_name = package_name
+
+                  if local_dep_name and local_dep_name not in selected and local_dep_name not in queue:
+                      queue.append(local_dep_name)
+
+          found = {
+              name: {
+                  "source": str((src / packages[name]["source"]).relative_to(Path.cwd())),
+                  "target": packages[name]["target"],
+                  "manifest": packages[name]["manifest"],
+              }
+              for name in sorted(selected)
           }
 
-          found = {}
-
-          for cargo_toml in src.rglob("Cargo.toml"):
-              if "target" in cargo_toml.parts:
-                  continue
-
-              try:
-                  data = tomllib.loads(cargo_toml.read_text())
-              except Exception:
-                  continue
-
-              name = data.get("package", {}).get("name")
-
-              if name in package_to_target:
-                  found[name] = {
-                      "source": str(cargo_toml.parent),
-                      "target": package_to_target[name],
-                  }
-
-          if "gpui-component" not in found:
-              print("Could not find package name gpui-component")
-              print("Cargo.toml files found:")
-              for cargo_toml in src.rglob("Cargo.toml"):
-                  print(f"  {cargo_toml}")
-              raise SystemExit(1)
+          imported_paths = sorted(item["target"] for item in found.values())
 
           output = Path(os.environ["GITHUB_OUTPUT"])
           with output.open("a") as f:
-              f.write(f"crates_json={json.dumps(found)}\n")
+              f.write(f"crates_json={json.dumps(found, sort_keys=True)}\n")
+              f.write(f"imported_paths_json={json.dumps(imported_paths)}\n")
 
-          print(json.dumps(found, indent=2))
+          print("Initial packages:", ", ".join(initial))
+          print("Imported package graph:")
+          print(json.dumps(found, indent=2, sort_keys=True))
 
-      - name: Import crates into zed/crates
+      - name: Import discovered packages into zed/crates
+        env:
+          CRATES_JSON: ${{ steps.detect.outputs.crates_json }}
         shell: python
         run: |
           from pathlib import Path
           import json
+          import os
           import shutil
 
-          crates = json.loads(r'''${{ steps.detect.outputs.crates_json }}''')
+          crates = json.loads(os.environ["CRATES_JSON"])
 
           Path("crates").mkdir(exist_ok=True)
+
+          selected_source_dirs = {Path(item["source"]).resolve() for item in crates.values()}
+
+          def make_ignore(source_root: Path):
+              fixed_ignore = shutil.ignore_patterns(".git", "target", ".DS_Store", "__MACOSX", "__MACOSX", "Thumbs.db", "desktop.ini", ".claude", ".codex", "AGENTS.md", "CLAUDE.md", "GEMINI.md")
+
+              def ignore(current_dir, names):
+                  ignored = set(fixed_ignore(current_dir, names))
+                  current = Path(current_dir)
+                  for name in names:
+                      candidate = (current / name).resolve()
+                      if candidate != source_root.resolve() and candidate in selected_source_dirs:
+                          ignored.add(name)
+                  return ignored
+
+              return ignore
 
           for package, item in crates.items():
               source = Path(item["source"])
@@ -129,94 +301,487 @@ jobs:
               if target.exists():
                   shutil.rmtree(target)
 
-              shutil.copytree(
-                  source,
-                  target,
-                  ignore=shutil.ignore_patterns(
-                      ".git",
-                      "target",
-                      ".DS_Store",
-                  ),
-              )
+              shutil.copytree(source, target, ignore=make_ignore(source))
 
               print(f"Imported {package}: {source} -> {target}")
 
-      - name: Patch root workspace Cargo.toml
+      - name: Import and validate relative path resources used by Rust files
+        id: resource_validation
+        env:
+          CRATES_JSON: ${{ steps.detect.outputs.crates_json }}
         shell: python
         run: |
           from pathlib import Path
           import json
+          import os
+          import re
+          import shutil
+
+          crates = json.loads(os.environ["CRATES_JSON"])
+          source_root = Path("_gpui_component_source").resolve()
+          workspace_root = Path.cwd().resolve()
+
+          # User-requested resource pre-filter. We keep this exact line-level
+          # search broad, then extract concrete relative path tokens below.
+          line_pattern = re.compile(r".*\.\./[-.\w]+.*")
+          relative_path_pattern = re.compile(
+              r"(?<![A-Za-z0-9_])((?:\.\./)+(?:[-.\w]+/)*[-.\w]+/?)"
+          )
+
+          ignored_dirs = {
+              ".git",
+              "target",
+              ".claude",
+              ".codex",
+              "__MACOSX",
+          }
+          ignored_names = {
+              ".DS_Store",
+              "Thumbs.db",
+              "desktop.ini",
+              "AGENTS.md",
+              "CLAUDE.md",
+              "GEMINI.md",
+          }
+
+          def is_under(path: Path, root: Path) -> bool:
+              try:
+                  path.resolve().relative_to(root.resolve())
+                  return True
+              except ValueError:
+                  return False
+
+          def copy_resource(source: Path, target: Path) -> None:
+              if source.is_dir():
+                  if target.exists():
+                      if target.is_dir():
+                          shutil.rmtree(target)
+                      else:
+                          target.unlink()
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copytree(
+                      source,
+                      target,
+                      ignore=shutil.ignore_patterns(
+                          ".git",
+                          "target",
+                          ".DS_Store",
+                          "__MACOSX",
+                          "Thumbs.db",
+                          "desktop.ini",
+                          ".claude",
+                          ".codex",
+                          "AGENTS.md",
+                          "CLAUDE.md",
+                          "GEMINI.md",
+                      ),
+                  )
+              elif source.is_file():
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  if target.exists() and target.is_dir():
+                      shutil.rmtree(target)
+                  shutil.copy2(source, target)
+              else:
+                  raise FileNotFoundError(source)
+
+          references = []
+          ignored_node_modules = []
+          imported = []
+          missing = []
+          source_missing = []
+          outside_source = []
+          outside_workspace = []
+          scanned_rs_files = 0
+          skipped_node_modules_rs_files = 0
+
+          def has_node_modules_part(path: Path) -> bool:
+              return "node_modules" in path.parts
+
+          def generated_path_for_summary(path) -> str:
+              # Summary display only: show the resolved generated path relative
+              # to the generated repository root. Example:
+              # /home/runner/work/gpui-binder/gpui-binder/themes/alduin.json
+              # -> themes/alduin.json
+              path = Path(str(path))
+              resolved = path if path.is_absolute() else (workspace_root / path)
+              resolved = resolved.resolve()
+              try:
+                  return resolved.relative_to(workspace_root).as_posix()
+              except ValueError:
+                  # For invalid outside-workspace references, still avoid rewriting
+                  # the original path into ../ style. The failure reason explains it.
+                  return resolved.as_posix()
+
+          for package, item in sorted(crates.items()):
+              source_pkg_dir = Path(item["source"]).resolve()
+              target_pkg_dir = Path(item["target"]).resolve()
+
+              if not source_pkg_dir.exists():
+                  source_missing.append({
+                      "package": package,
+                      "file": str(Path(item["source"])),
+                      "line": 0,
+                      "path": ".",
+                      "source_resolved": str(source_pkg_dir),
+                      "target_resolved": str(target_pkg_dir),
+                      "reason": "imported package source directory is missing",
+                  })
+                  continue
+
+              for source_rs in sorted(source_pkg_dir.rglob("*.rs")):
+                  try:
+                      rel_rs = source_rs.relative_to(source_pkg_dir)
+                  except ValueError:
+                      continue
+
+                  if "node_modules" in rel_rs.parts:
+                      skipped_node_modules_rs_files += 1
+                      continue
+
+                  if any(part in ignored_dirs for part in rel_rs.parts):
+                      continue
+                  scanned_rs_files += 1
+
+                  target_rs = target_pkg_dir / rel_rs
+                  if not target_rs.exists():
+                      # This should not normally happen because the package was copied
+                      # first. Report it as a target-side missing resource so the run
+                      # fails with a useful summary instead of hiding an over-exclusion.
+                      missing.append({
+                          "package": package,
+                          "file": str(Path(item["target"]) / rel_rs),
+                          "line": 0,
+                          "path": str(rel_rs),
+                          "source_resolved": str(source_rs),
+                          "target_resolved": str(target_rs),
+                          "reason": "Rust source file was not copied into the generated workspace",
+                      })
+                      continue
+
+                  try:
+                      lines = source_rs.read_text(encoding="utf-8").splitlines()
+                  except UnicodeDecodeError:
+                      lines = source_rs.read_text(errors="replace").splitlines()
+
+                  for lineno, line in enumerate(lines, 1):
+                      if not line_pattern.search(line):
+                          continue
+
+                      rel_paths = sorted(set(relative_path_pattern.findall(line)))
+                      if not rel_paths:
+                          continue
+
+                      for rel_path_text in rel_paths:
+                          source_resolved = (source_rs.parent / rel_path_text).resolve()
+                          target_resolved = (target_rs.parent / rel_path_text).resolve()
+
+                          reference = {
+                              "package": package,
+                              "file": str(Path(item["target"]) / rel_rs),
+                              "line": lineno,
+                              "path": rel_path_text,
+                              "source_resolved": str(source_resolved),
+                              "target_resolved": str(target_resolved),
+                              "line_text": line.strip(),
+                          }
+
+                          if (
+                              "node_modules" in Path(rel_path_text).parts
+                              or has_node_modules_part(source_resolved)
+                              or has_node_modules_part(target_resolved)
+                          ):
+                              ignored_reference = dict(reference)
+                              ignored_reference["reason"] = "ignored because the referenced path is under node_modules"
+                              ignored_node_modules.append(ignored_reference)
+                              continue
+
+                          references.append(reference)
+
+                          if not is_under(target_resolved, workspace_root):
+                              reference["reason"] = "resolved generated path is outside the generated workspace"
+                              outside_workspace.append(reference)
+                              continue
+
+                          if not is_under(source_resolved, source_root):
+                              reference["reason"] = "resolved source path is outside the gpui-component checkout"
+                              outside_source.append(reference)
+                              continue
+
+                          if target_resolved.exists():
+                              continue
+
+                          if not source_resolved.exists():
+                              reference["reason"] = "resolved source path does not exist in the gpui-component checkout"
+                              source_missing.append(reference)
+                              continue
+
+                          copy_resource(source_resolved, target_resolved)
+                          if target_resolved.exists():
+                              imported.append(reference)
+                          else:
+                              reference["reason"] = "copy completed but target path is still missing"
+                              missing.append(reference)
+
+          missing_after_copy = []
+          for reference in references:
+              target_resolved = Path(reference["target_resolved"])
+              if not target_resolved.exists():
+                  if reference not in source_missing and reference not in outside_source and reference not in missing:
+                      item = dict(reference)
+                      item["reason"] = "target path does not exist after resource import"
+                      missing_after_copy.append(item)
+
+          failures = outside_workspace + outside_source + source_missing + missing + missing_after_copy
+
+          def markdown_cell(value) -> str:
+              text = str(value)
+              return text.replace("|", "\\|").replace("\n", "<br>")
+
+          def write_rows(summary, rows, limit=80):
+              for row in rows[:limit]:
+                  generated_path = generated_path_for_summary(row.get("target_resolved", "")) if row.get("target_resolved") else ""
+                  summary.write(
+                      "| "
+                      + markdown_cell(row.get("package", ""))
+                      + " | `"
+                      + markdown_cell(row.get("file", ""))
+                      + "` | "
+                      + markdown_cell(row.get("line", ""))
+                      + " | `"
+                      + markdown_cell(row.get("path", ""))
+                      + "` | `"
+                      + markdown_cell(generated_path)
+                      + "` | "
+                      + markdown_cell(row.get("reason", ""))
+                      + " |\n"
+                  )
+              if len(rows) > limit:
+                  summary.write(f"\nOnly the first {limit} rows are shown out of {len(rows)}.\n")
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              with Path(summary_path).open("a") as summary:
+                  summary.write("\n### Relative path resource validation\n")
+                  summary.write(
+                      f"Scanned `{scanned_rs_files}` Rust source files from `{len(crates)}` imported package(s) "
+                      f"for line pattern `.*\\.\\./[-.\\w]+.*`.\n\n"
+                  )
+                  summary.write(f"Found `{len(references)}` relative path reference(s).\n\n")
+
+                  if imported:
+                      summary.write("#### Source resources imported automatically\n\n")
+                      summary.write("| Package | Rust file | Line | Relative path | Generated path | Reason |\n")
+                      summary.write("|---|---|---:|---|---|---|\n")
+                      rows = []
+                      for row in imported:
+                          imported_row = dict(row)
+                          imported_row["reason"] = "copied from gpui-component source checkout"
+                          rows.append(imported_row)
+                      write_rows(summary, rows)
+                      summary.write("\n")
+
+                  if ignored_node_modules:
+                      summary.write("#### Ignored node_modules relative path references\n\n")
+                      summary.write(
+                          "These paths are intentionally ignored because they point to files/folders under `node_modules`.\n\n"
+                      )
+                      summary.write("| Package | Rust file | Line | Relative path | Generated path | Reason |\n")
+                      summary.write("|---|---|---:|---|---|---|\n")
+                      write_rows(summary, ignored_node_modules)
+                      summary.write("\n")
+
+                  if failures:
+                      summary.write("#### Missing relative path resources\n\n")
+                      summary.write(
+                          "These paths were referenced from imported Rust files but were not found in the generated workspace. "
+                          "References under `node_modules` are excluded from this failure list.\n\n"
+                      )
+                      summary.write("| Package | Rust file | Line | Relative path | Generated path | Reason |\n")
+                      summary.write("|---|---|---:|---|---|---|\n")
+                      write_rows(summary, failures)
+                  else:
+                      summary.write("All checked relative path resources resolve in the generated workspace.\n")
+
+          imported_resource_paths = sorted({
+              generated_path_for_summary(row["target_resolved"])
+              for row in imported
+              if row.get("target_resolved")
+          })
+
+          github_output = os.environ.get("GITHUB_OUTPUT")
+          if github_output:
+              with Path(github_output).open("a") as output:
+                  output.write(f"imported_resource_paths_json={json.dumps(imported_resource_paths)}\n")
+
+          print(
+              f"Relative path resource validation: scanned {scanned_rs_files} Rust files, "
+              f"skipped {skipped_node_modules_rs_files} node_modules Rust files, "
+              f"found {len(references)} checked references, "
+              f"ignored {len(ignored_node_modules)} node_modules references, "
+              f"imported {len(imported_resource_paths)} resource path(s), failures {len(failures)}."
+          )
+
+          if failures:
+              raise SystemExit(
+                  "Missing relative path resources referenced by imported gpui-component Rust files "
+                  "after excluding node_modules paths. See the GitHub workflow summary for details."
+              )
+
+      - name: Patch root workspace Cargo.toml
+        env:
+          CRATES_JSON: ${{ steps.detect.outputs.crates_json }}
+        shell: python
+        run: |
+          from pathlib import Path
+          import json
+          import os
           import re
 
-          crates = json.loads(r'''${{ steps.detect.outputs.crates_json }}''')
+          crates = json.loads(os.environ["CRATES_JSON"])
 
           root = Path("Cargo.toml")
           text = root.read_text()
 
-          members_to_add = [
+          def unique(values):
+              seen = set()
+              out = []
+              for value in values:
+                  if value in seen:
+                      continue
+                  seen.add(value)
+                  out.append(value)
+              return out
+
+          def ensure_workspace_table(text: str) -> str:
+              if re.search(r'(?m)^\[workspace\]\s*$', text):
+                  return text
+              suffix = "" if text.endswith("\n") else "\n"
+              return text + suffix + "\n[workspace]\n"
+
+          def workspace_bounds(text: str):
+              match = re.search(r'(?ms)^\[workspace\]\s*(.*?)(?=^\[|\Z)', text)
+              if not match:
+                  raise SystemExit("Could not find [workspace] table")
+              return match.start(), match.end(), match.group(0)
+
+          def read_array(block: str, key: str) -> list[str]:
+              match = re.search(rf'(?ms)^\s*{re.escape(key)}\s*=\s*\[(.*?)\]', block)
+              if not match:
+                  return []
+              return re.findall(r'"([^"]+)"', match.group(1))
+
+          def write_array(block: str, key: str, values: list[str]) -> str:
+              values = unique(values)
+              replacement = f"{key} = [\n"
+              replacement += "".join(f'    "{value}",\n' for value in values)
+              replacement += "]"
+
+              pattern = re.compile(rf'(?ms)^\s*{re.escape(key)}\s*=\s*\[(.*?)\]')
+              match = pattern.search(block)
+              if match:
+                  return block[:match.start()] + replacement + block[match.end():]
+
+              header = re.search(r'(?m)^\[workspace\]\s*$', block)
+              if not header:
+                  raise SystemExit("Could not find [workspace] header")
+              insert_at = header.end()
+              return block[:insert_at] + "\n" + replacement + "\n" + block[insert_at:]
+
+          def section_bounds(text: str, section_name: str):
+              header = re.search(rf'(?m)^\[{re.escape(section_name)}\][^\S\r\n]*$', text)
+              if not header:
+                  return None
+              body_start = header.end()
+              if body_start < len(text) and text[body_start] == "\n":
+                  body_start += 1
+              next_header = re.search(r'(?m)^\[', text[body_start:])
+              section_end = body_start + next_header.start() if next_header else len(text)
+              return header.start(), header.end(), body_start, section_end
+
+          def ensure_section(text: str, section_name: str) -> str:
+              if section_bounds(text, section_name):
+                  return text
+              suffix = "" if text.endswith("\n") else "\n"
+              return text + suffix + f"\n[{section_name}]\n"
+
+          def remove_dependency_entry(section: str, key: str) -> str:
+              lines = section.splitlines(keepends=True)
+              result = []
+              i = 0
+              while i < len(lines):
+                  line = lines[i]
+                  stripped = line.strip()
+                  if re.match(rf'^{re.escape(key)}(?:\.workspace\s*=|\s*=)', stripped):
+                      depth_curly = 0
+                      depth_square = 0
+                      while i < len(lines):
+                          code = lines[i].split("#", 1)[0]
+                          depth_curly += code.count("{") - code.count("}")
+                          depth_square += code.count("[") - code.count("]")
+                          i += 1
+                          if depth_curly <= 0 and depth_square <= 0:
+                              break
+                      continue
+                  result.append(line)
+                  i += 1
+              return "".join(result)
+
+          def set_dependency_entry(text: str, section_name: str, key: str, value: str) -> str:
+              text = ensure_section(text, section_name)
+              bounds = section_bounds(text, section_name)
+              if not bounds:
+                  raise SystemExit(f"Could not find [{section_name}] after creating it")
+              _, _, body_start, section_end = bounds
+              section = text[body_start:section_end]
+              section = remove_dependency_entry(section, key)
+              if section and not section.endswith("\n"):
+                  section += "\n"
+              section += f"{key} = {value}\n"
+              return text[:body_start] + section + text[section_end:]
+
+          imported_members = sorted(
               item["target"]
               for item in crates.values()
-              if Path(item["target"]).exists()
-          ]
-
-          if not re.search(r'(?m)^\[workspace\]\s*$', text):
-              text += "\n[workspace]\n"
-
-          members_match = re.search(r'(?ms)^members\s*=\s*\[(.*?)\]', text)
-
-          if members_match:
-              block = members_match.group(0)
-              inner = members_match.group(1)
-              existing_members = set(re.findall(r'"([^"]+)"', inner))
-
-              additions = []
-              for member in members_to_add:
-                  if member not in existing_members:
-                      additions.append(f'    "{member}",')
-
-              if additions:
-                  new_block = block[:-1].rstrip() + "\n" + "\n".join(additions) + "\n]"
-                  text = text[:members_match.start()] + new_block + text[members_match.end():]
-          else:
-              workspace_match = re.search(r'(?m)^\[workspace\]\s*$', text)
-              insert_at = workspace_match.end()
-
-              member_lines = "\n\nmembers = [\n"
-              for member in members_to_add:
-                  member_lines += f'    "{member}",\n'
-              member_lines += "]\n"
-
-              text = text[:insert_at] + member_lines + text[insert_at:]
-
-          if "[workspace.dependencies]" not in text:
-              text += "\n[workspace.dependencies]\n"
-
-          dep_section = re.search(
-              r'(?ms)^\[workspace\.dependencies\]\s*(.*?)(?=^\[|\Z)',
-              text,
+              if Path(item["target"]).joinpath("Cargo.toml").exists()
           )
 
-          deps_to_add = {
-              package: f'{{ path = "{item["target"]}" }}'
-              for package, item in crates.items()
-              if Path(item["target"]).exists()
-          }
+          text = ensure_workspace_table(text)
+          ws_start, ws_end, workspace_block = workspace_bounds(text)
+          existing_members = read_array(workspace_block, "members")
 
-          if dep_section:
-              section = dep_section.group(0)
-              additions = []
+          members = unique(existing_members + imported_members)
+          if Path("crates/gpui_facade/Cargo.toml").exists() and "crates/gpui_facade" not in members:
+              members.append("crates/gpui_facade")
 
-              for name, value in deps_to_add.items():
-                  if not re.search(rf'(?m)^\s*{re.escape(name)}\s*=', section):
-                      additions.append(f'{name} = {value}')
+          # Make root `cargo check` useful on the generated final branch.
+          # This is data-driven from the imported package graph, so future
+          # gpui-component package additions/removals are reflected automatically.
+          default_members = []
+          if Path("crates/gpui_facade/Cargo.toml").exists():
+              default_members.append("crates/gpui_facade")
+          default_members.extend(imported_members)
+          member_set = set(members)
+          default_members = [member for member in unique(default_members) if member in member_set]
 
-              if additions:
-                  new_section = section.rstrip() + "\n" + "\n".join(additions) + "\n"
-                  text = text[:dep_section.start()] + new_section + text[dep_section.end():]
+          workspace_block = write_array(workspace_block, "members", members)
+          workspace_block = write_array(workspace_block, "default-members", default_members)
+          text = text[:ws_start] + workspace_block + text[ws_end:]
+
+          for package, item in sorted(crates.items()):
+              target = item["target"]
+              if Path(target).joinpath("Cargo.toml").exists():
+                  text = set_dependency_entry(
+                      text,
+                      "workspace.dependencies",
+                      package,
+                      f'{{ path = "{target}" }}',
+                  )
 
           root.write_text(text)
 
-      - name: Expand gpui-component source workspace dependencies locally
+      - name: Expand missing source workspace dependencies locally
+        env:
+          CRATES_JSON: ${{ steps.detect.outputs.crates_json }}
         shell: python
         run: |
           from pathlib import Path
@@ -225,13 +790,16 @@ jobs:
           import re
           import tomllib
 
-          crates = json.loads(r'''${{ steps.detect.outputs.crates_json }}''')
+          crates = json.loads(os.environ["CRATES_JSON"])
+          imported_packages = set(crates.keys())
 
           source_root = Path("_gpui_component_source/Cargo.toml")
           if not source_root.exists():
               raise SystemExit("Missing _gpui_component_source/Cargo.toml")
 
+          root_path = Path("Cargo.toml")
           source_text = source_root.read_text()
+          root_text = root_path.read_text()
 
           def extract_section(text: str, section_name: str) -> str:
               match = re.search(
@@ -245,18 +813,19 @@ jobs:
               current = []
               depth_curly = 0
               depth_square = 0
+              current_name = None
 
               for raw_line in section.splitlines():
                   line = raw_line.rstrip()
 
                   if not current:
                       stripped = line.strip()
-
                       if not stripped or stripped.startswith("#"):
                           continue
-
-                      if not re.match(r'^[A-Za-z0-9_\-]+\s*=', stripped):
+                      match = re.match(r'^([A-Za-z0-9_\-]+)(?:\.workspace)?\s*=', stripped)
+                      if not match:
                           continue
+                      current_name = match.group(1)
 
                   current.append(line)
 
@@ -270,177 +839,983 @@ jobs:
                       depth_curly = 0
                       depth_square = 0
 
-                      match = re.match(r'^\s*([A-Za-z0-9_\-]+)\s*=', entry)
-                      if match:
-                          entries[match.group(1)] = entry
+                      if current_name:
+                          entries[current_name] = entry
+                      current_name = None
 
               return entries
 
-          source_deps_section = extract_section(source_text, "workspace.dependencies")
-          if not source_deps_section:
-              raise SystemExit("Source repo has no [workspace.dependencies]")
+          source_deps = parse_dependency_entries(extract_section(source_text, "workspace.dependencies"))
+          target_workspace_deps = parse_dependency_entries(
+              extract_section(root_text, "workspace.dependencies")
+          )
 
-          source_deps = parse_dependency_entries(source_deps_section)
+          def parse_dependency_entry(entry: str, dep_name: str, header: str = "dependencies"):
+              try:
+                  parsed = tomllib.loads(f"[{header}]\n" + entry + "\n")
+                  value = parsed.get(header, {}).get(dep_name)
+              except Exception:
+                  value = None
+              if isinstance(value, str):
+                  return {"version": value, "__name": dep_name}
+              if isinstance(value, dict):
+                  out = dict(value)
+                  out["__name"] = dep_name
+                  return out
+              return {"__name": dep_name}
 
-          imported_packages = set(crates.keys())
+          def parse_workspace_dependency_entry(entry: str):
+              match = re.match(r'^\s*([A-Za-z0-9_\-]+)\s*=', entry)
+              if not match:
+                  return None, None
 
-          keep_workspace = imported_packages | {
-              "gpui",
-              "gpui_platform",
-              "gpui_macros",
-              "gpui_web",
-              "story",
-          }
+              dep_name = match.group(1)
+              try:
+                  parsed = tomllib.loads("[workspace]\n[workspace.dependencies]\n" + entry + "\n")
+                  value = parsed.get("workspace", {}).get("dependencies", {}).get(dep_name)
+              except Exception:
+                  value = None
+              return dep_name, value
+
+          def dependency_table(entry: str) -> dict:
+              dep_name, value = parse_workspace_dependency_entry(entry)
+              if isinstance(value, str):
+                  return {"version": value, "__name": dep_name}
+              if isinstance(value, dict):
+                  out = dict(value)
+                  out["__name"] = dep_name
+                  return out
+              return {"__name": dep_name}
+
+          def dependency_entry_table(entry: str, dep_name: str):
+              return parse_dependency_entry(entry, dep_name, "dependencies")
+
+          def entry_override_kind(entry: str):
+              value = dependency_table(entry)
+              if isinstance(value.get("path"), str):
+                  return "path"
+              if isinstance(value.get("git"), str):
+                  return "git"
+              return None
+
+          def git_identity(value: dict):
+              dep_name = value.get("__name")
+              package_name = value.get("package", dep_name)
+              return (
+                  value.get("git"),
+                  value.get("rev"),
+                  value.get("tag"),
+                  value.get("branch"),
+                  package_name,
+                  value.get("version"),
+              )
+
+          def ordered_features(value: dict) -> list[str]:
+              raw = value.get("features", [])
+              if not isinstance(raw, list):
+                  return []
+              out = []
+              seen = set()
+              for feature in raw:
+                  if not isinstance(feature, str) or feature in seen:
+                      continue
+                  out.append(feature)
+                  seen.add(feature)
+              return out
+
+          def feature_set(value: dict) -> set[str]:
+              return set(ordered_features(value))
+
+          def default_features(value: dict) -> bool:
+              raw = value.get("default-features")
+              return True if raw is None else bool(raw)
+
+          def package_name(value: dict) -> str:
+              name = value.get("__name", "")
+              package = value.get("package", name)
+              return package if isinstance(package, str) else name
+
+          def is_plain_registry_dependency(value: dict) -> bool:
+              # Only rewrite plain registry/crates.io-style dependencies. Path/git
+              # dependencies carry source identity and must not be normalized by a
+              # version-only rule. Custom registries are also left explicit because
+              # the target root entry may not resolve to the same source.
+              return not any(isinstance(value.get(key), str) for key in ("path", "git", "registry"))
+
+          def version_req(value: dict):
+              version = value.get("version")
+              return version if isinstance(version, str) else None
+
+          def parse_simple_version_req(req: str):
+              if not isinstance(req, str):
+                  return None
+              raw = req.strip()
+              if raw.startswith("^"):
+                  raw = raw[1:].strip()
+              match = re.fullmatch(r'(\d+)(?:\.(\d+))?(?:\.(\d+))?', raw)
+              if not match:
+                  return None
+              parts = [int(part) if part is not None else 0 for part in match.groups()]
+              major, minor, patch = parts
+              # A bare "0" is too broad to auto-reason about safely.
+              if major == 0 and match.group(2) is None:
+                  return None
+              return {
+                  "tuple": (major, minor, patch),
+                  "major": major,
+                  "minor": minor,
+                  "patch": patch,
+                  "normalized": raw,
+              }
+
+          def compatibility_lane(parsed_version: dict):
+              major = parsed_version["major"]
+              # For 0.x, Cargo semver compatibility is bounded by the minor
+              # component, so do not auto-merge 0.4 and 0.5 into one root dep.
+              if major == 0:
+                  return (0, parsed_version["minor"])
+              return (major,)
+
+          def version_summary_from_value(value: dict) -> str:
+              req = version_req(value)
+              return req if req is not None else "<no explicit version>"
+
+          def version_identity_is_compatible(source_value: dict, target_value: dict) -> bool:
+              source_req = version_req(source_value)
+              target_req = version_req(target_value)
+              if not source_req or not target_req:
+                  return True
+
+              source_parsed = parse_simple_version_req(source_req)
+              target_parsed = parse_simple_version_req(target_req)
+              if source_parsed and target_parsed:
+                  return compatibility_lane(source_parsed) == compatibility_lane(target_parsed)
+
+              # Unsupported version expressions are not safe to normalize when
+              # they differ, because we cannot robustly compare their ranges with
+              # only the standard library available in the workflow.
+              return source_req == target_req
+
+          def target_workspace_dep_is_inheritable(source_entry: str, target_entry: str) -> bool:
+              """Return whether imported manifests may keep dep = { workspace = true }.
+
+              This checks dependency identity and non-additive behavior. Feature
+              differences are handled separately by adding missing source features
+              to the member dependency line, because workspace and member features
+              are additive.
+              """
+              source_kind = entry_override_kind(source_entry)
+              target_kind = entry_override_kind(target_entry)
+
+              # Source path dependencies are relative to the source repository, so
+              # inheriting a target-root path would be unsafe unless future logic
+              # explicitly remaps that path. Keep expanding those locally.
+              if source_kind == "path" or target_kind == "path":
+                  return False
+
+              source_value = dependency_table(source_entry)
+              target_value = dependency_table(target_entry)
+
+              if package_name(source_value) != package_name(target_value):
+                  return False
+
+              # Git dependencies must point at the same repo/ref/package/version.
+              # Otherwise workspace inheritance would silently switch sources.
+              if source_kind == "git" or target_kind == "git":
+                  if source_kind != "git" or target_kind != "git":
+                      return False
+                  if git_identity(source_value) != git_identity(target_value):
+                      return False
+
+              # Plain registry dependencies can inherit only when the version
+              # requirements are in the same compatibility lane. The root version
+              # may have been raised earlier in this step to the highest compatible
+              # imported lower bound.
+              if source_kind is None and target_kind is None:
+                  if not version_identity_is_compatible(source_value, target_value):
+                      return False
+
+              # default-features is not additive like features. If the source and
+              # target disagree, expand locally rather than silently changing the
+              # imported package's default feature behavior.
+              if default_features(source_value) != default_features(target_value):
+                  return False
+
+              return True
+
+          def missing_workspace_features(source_entry: str, target_entry: str) -> list[str]:
+              source_value = dependency_table(source_entry)
+              target_value = dependency_table(target_entry)
+              target_features = feature_set(target_value)
+              return [
+                  feature
+                  for feature in ordered_features(source_value)
+                  if feature not in target_features
+              ]
+
+          def should_expand_source_workspace_dep(dep_name: str, source_entry: str) -> bool:
+              target_entry = target_workspace_deps.get(dep_name)
+              if not target_entry:
+                  return True
+
+              # Inherit target workspace dependencies whenever that is semantically
+              # safe. For ordinary registry dependencies, this aligns the imported
+              # package to the generated root workspace version after the root has
+              # been reconciled to the highest compatible imported lower bound.
+              return not target_workspace_dep_is_inheritable(source_entry, target_entry)
+
+          def render_toml_value(value):
+              if isinstance(value, bool):
+                  return "true" if value else "false"
+              if isinstance(value, str):
+                  return json.dumps(value)
+              if isinstance(value, list) and all(isinstance(item, str) for item in value):
+                  return "[" + ", ".join(json.dumps(item) for item in value) + "]"
+              return None
+
+          def render_dependency_line(dep_name: str, value: dict, indent: str = "") -> str:
+              order = [
+                  "workspace",
+                  "version",
+                  "path",
+                  "git",
+                  "rev",
+                  "tag",
+                  "branch",
+                  "package",
+                  "default-features",
+                  "features",
+                  "optional",
+              ]
+              parts = []
+              emitted = set()
+              for key in order:
+                  if key in value:
+                      rendered = render_toml_value(value[key])
+                      if rendered is not None:
+                          parts.append(f"{key} = {rendered}")
+                          emitted.add(key)
+              for key in sorted(k for k in value if k not in emitted and not k.startswith("__")):
+                  rendered = render_toml_value(value[key])
+                  if rendered is not None:
+                      parts.append(f"{key} = {rendered}")
+              if not parts:
+                  return f"{indent}{dep_name}.workspace = true"
+              return f"{indent}{dep_name} = {{ " + ", ".join(parts) + " }"
+
+          def merge_ordered_features(*feature_lists: list[str]) -> list[str]:
+              out = []
+              seen = set()
+              for feature_list in feature_lists:
+                  for feature in feature_list:
+                      if feature not in seen:
+                          out.append(feature)
+                          seen.add(feature)
+              return out
+
+          def dependency_summary(entry: str) -> str:
+              value = dependency_table(entry)
+              version = value.get("version")
+              if isinstance(value.get("path"), str):
+                  base = f"path:{value['path']}"
+              elif isinstance(value.get("git"), str):
+                  ref = value.get("rev") or value.get("tag") or value.get("branch") or "<floating>"
+                  package = value.get("package", value.get("__name", ""))
+                  version_part = f", version {version}" if isinstance(version, str) else ""
+                  base = f"git:{value['git']} @ {ref}, package {package}{version_part}"
+              elif isinstance(version, str):
+                  base = f"version {version}"
+              else:
+                  base = "no explicit version"
+
+              features = ordered_features(value)
+              if features:
+                  shown = ", ".join(features[:8])
+                  if len(features) > 8:
+                      shown += f", …(+{len(features) - 8})"
+                  base += f"; features [{shown}]"
+
+              if default_features(value) is False:
+                  base += "; default-features=false"
+              return base
+
+          def markdown_cell(value: str) -> str:
+              value = re.sub(r'\s+', ' ', value).strip()
+              value = value.replace("|", "\\|")
+              if len(value) > 220:
+                  value = value[:217] + "..."
+              return value
+
+          def package_name_for_manifest(cargo_toml: Path) -> str:
+              try:
+                  data = tomllib.loads(cargo_toml.read_text())
+                  name = data.get("package", {}).get("name")
+                  if isinstance(name, str) and name:
+                      return name
+              except Exception:
+                  pass
+              return str(cargo_toml.parent)
+
+          def dependency_section_header(name: str) -> bool:
+              if name in {"dependencies", "dev-dependencies", "build-dependencies"}:
+                  return True
+              return name.startswith("target.") and name.endswith((
+                  ".dependencies",
+                  ".dev-dependencies",
+                  ".build-dependencies",
+              ))
+
+          def iter_dependency_sections(text: str):
+              headers = list(re.finditer(r'(?m)^\[([^\]]+)\][^\S\r\n]*$', text))
+              for index, header in enumerate(headers):
+                  name = header.group(1)
+                  if not dependency_section_header(name):
+                      continue
+                  body_start = header.end()
+                  if body_start < len(text) and text[body_start] == "\n":
+                      body_start += 1
+                  section_end = headers[index + 1].start() if index + 1 < len(headers) else len(text)
+                  yield name, body_start, section_end, text[body_start:section_end]
+
+          def rewrite_named_entries_in_section(section: str, dep_name: str, rewriter) -> tuple[str, int]:
+              lines = section.splitlines(keepends=True)
+              out = []
+              i = 0
+              replaced = 0
+              start_re = re.compile(rf'^\s*{re.escape(dep_name)}(?:\.workspace\s*=|\s*=)')
+              while i < len(lines):
+                  line = lines[i]
+                  if not start_re.match(line):
+                      out.append(line)
+                      i += 1
+                      continue
+
+                  entry_lines = []
+                  depth_curly = 0
+                  depth_square = 0
+                  while i < len(lines):
+                      current = lines[i]
+                      entry_lines.append(current)
+                      code = current.split("#", 1)[0]
+                      depth_curly += code.count("{") - code.count("}")
+                      depth_square += code.count("[") - code.count("]")
+                      i += 1
+                      if depth_curly <= 0 and depth_square <= 0:
+                          break
+
+                  entry_text = "".join(entry_lines)
+                  replacement = rewriter(entry_text.rstrip("\n"))
+                  if replacement is None:
+                      out.append(entry_text)
+                  else:
+                      out.append(replacement + ("\n" if entry_text.endswith("\n") else ""))
+                      replaced += 1
+
+              return "".join(out), replaced
+
+          def rewrite_dependency_entries_in_dependency_sections(text: str, dep_name: str, rewriter) -> tuple[str, int]:
+              replacements = []
+              total = 0
+              for _, body_start, section_end, body in iter_dependency_sections(text):
+                  new_body, replaced = rewrite_named_entries_in_section(body, dep_name, rewriter)
+                  if replaced:
+                      replacements.append((body_start, section_end, new_body))
+                      total += replaced
+
+              for body_start, section_end, new_body in reversed(replacements):
+                  text = text[:body_start] + new_body + text[section_end:]
+              return text, total
+
+          def rewrite_workspace_dependency_entries(text: str, dep_name: str, rewriter) -> tuple[str, int]:
+              def only_workspace(original_entry: str):
+                  value = dependency_entry_table(original_entry, dep_name)
+                  if value.get("workspace") is not True:
+                      return None
+                  return rewriter(original_entry)
+              return rewrite_dependency_entries_in_dependency_sections(text, dep_name, only_workspace)
+
+          def replace_workspace_dependency_entry(text: str, dep_name: str, replacement_entry: str) -> tuple[str, int]:
+              match = re.search(r'(?m)^\[workspace\.dependencies\][^\S\r\n]*$', text)
+              if not match:
+                  return text, 0
+              body_start = match.end()
+              if body_start < len(text) and text[body_start] == "\n":
+                  body_start += 1
+              next_header = re.search(r'(?m)^\[', text[body_start:])
+              section_end = body_start + next_header.start() if next_header else len(text)
+              section = text[body_start:section_end]
+              new_section, replaced = rewrite_named_entries_in_section(
+                  section,
+                  dep_name,
+                  lambda _entry: replacement_entry,
+              )
+              if replaced:
+                  return text[:body_start] + new_section + text[section_end:], replaced
+              return text, 0
+
+          def update_workspace_entry_version(entry: str, dep_name: str, new_version: str) -> str:
+              if re.match(rf'^\s*{re.escape(dep_name)}\s*=\s*"[^"]+"\s*$', entry):
+                  return re.sub(r'"[^"]+"', json.dumps(new_version), entry, count=1)
+              if re.search(r'\bversion\s*=', entry):
+                  return re.sub(r'(\bversion\s*=\s*)"[^"]+"', rf'\1{json.dumps(new_version)}', entry, count=1)
+              return entry
 
           local_packages = {}
-
           for cargo_toml in Path("crates").glob("*/Cargo.toml"):
               try:
                   data = tomllib.loads(cargo_toml.read_text())
               except Exception:
                   continue
-
               name = data.get("package", {}).get("name")
               if name:
                   local_packages[name] = cargo_toml.parent
 
-          def rewrite_zed_git_dependency_to_local_for_manifest(entry: str, manifest: Path) -> str:
-              if "github.com/zed-industries/" not in entry:
-                  return entry
+          version_candidates = {}
+          version_skips = []
 
-              match = re.match(r'^\s*([A-Za-z0-9_\-]+)\s*=\s*\{(.*)\}\s*$', entry, re.S)
-              if not match:
-                  return entry
+          def add_version_candidate(dep_name: str, source_entry: str, cargo_toml: Path, origin: str):
+              if dep_name in imported_packages or dep_name == "gpui":
+                  return
+              target_entry = target_workspace_deps.get(dep_name)
+              if not target_entry:
+                  return
 
-              dep_name = match.group(1)
-              body = match.group(2)
+              source_value = dependency_table(source_entry)
+              target_value = dependency_table(target_entry)
+              package = package_name_for_manifest(cargo_toml)
 
-              package_match = re.search(r'package\s*=\s*"([^"]+)"', body)
-              package_name = package_match.group(1) if package_match else dep_name
+              if not is_plain_registry_dependency(source_value) or not is_plain_registry_dependency(target_value):
+                  return
+              if package_name(source_value) != package_name(target_value):
+                  version_skips.append((dep_name, package, origin, version_summary_from_value(source_value), version_summary_from_value(target_value), "package/source identity differs"))
+                  return
+              if default_features(source_value) != default_features(target_value):
+                  version_skips.append((dep_name, package, origin, version_summary_from_value(source_value), version_summary_from_value(target_value), "default-features differs"))
+                  return
 
-              local_path = local_packages.get(package_name)
+              source_req = version_req(source_value)
+              target_req = version_req(target_value)
+              source_parsed = parse_simple_version_req(source_req) if source_req else None
+              target_parsed = parse_simple_version_req(target_req) if target_req else None
+              if not source_parsed or not target_parsed:
+                  if source_req and target_req and source_req != target_req:
+                      version_skips.append((dep_name, package, origin, source_req, target_req, "unsupported version requirement syntax"))
+                  return
 
-              if not local_path:
-                  print(f"No local package for {dep_name} / {package_name}; keeping source dependency.")
-                  return entry
+              if compatibility_lane(source_parsed) != compatibility_lane(target_parsed):
+                  version_skips.append((dep_name, package, origin, source_req, target_req, "different Cargo-compatible version lane"))
+                  return
 
-              relative_path = os.path.relpath(local_path, manifest.parent)
-              relative_path = relative_path.replace(os.sep, "/")
-
-              preserved = []
-
-              if package_name != dep_name:
-                  preserved.append(f'package = "{package_name}"')
-
-              features_match = re.search(r'features\s*=\s*\[([^\]]*)\]', body, re.S)
-              if features_match:
-                  preserved.append("features = [" + features_match.group(1).strip() + "]")
-
-              default_features_match = re.search(r'default-features\s*=\s*(true|false)', body)
-              if default_features_match:
-                  preserved.append(f"default-features = {default_features_match.group(1)}")
-
-              optional_match = re.search(r'optional\s*=\s*(true|false)', body)
-              if optional_match:
-                  preserved.append(f"optional = {optional_match.group(1)}")
-
-              parts = [f'path = "{relative_path}"'] + preserved
-              rewritten = f'{dep_name} = {{ ' + ", ".join(parts) + " }"
-
-              print(f"Rewrote {dep_name} for {manifest}: zed-industries git -> {relative_path}")
-              return rewritten
-
-          source_dep_names = [
-              name
-              for name in source_deps.keys()
-              if name not in keep_workspace
-          ]
-
-          def replace_workspace_dep_line(text: str, dep_name: str, replacement: str) -> str:
-              text = re.sub(
-                  rf'(?m)^\s*{re.escape(dep_name)}\.workspace\s*=\s*true\s*$',
-                  replacement,
-                  text,
-              )
-
-              text = re.sub(
-                  rf'(?m)^\s*{re.escape(dep_name)}\s*=\s*\{{[^\n]*workspace\s*=\s*true[^\n]*\}}\s*$',
-                  replacement,
-                  text,
-              )
-
-              return text
+              version_candidates.setdefault(dep_name, []).append({
+                  "package": package,
+                  "origin": origin,
+                  "source_entry": source_entry,
+                  "source_value": source_value,
+                  "source_req": source_req,
+                  "source_parsed": source_parsed,
+              })
 
           for item in crates.values():
               target = Path(item["target"])
+              for cargo_toml in target.rglob("Cargo.toml"):
+                  manifest_text = cargo_toml.read_text()
+                  for _, _, _, section in iter_dependency_sections(manifest_text):
+                      for dep_name, original_entry in parse_dependency_entries(section).items():
+                          original_value = dependency_entry_table(original_entry, dep_name)
+                          if original_value.get("workspace") is True:
+                              source_entry = source_deps.get(dep_name)
+                              if source_entry:
+                                  add_version_candidate(dep_name, source_entry, cargo_toml, "source workspace")
+                          else:
+                              add_version_candidate(dep_name, original_entry, cargo_toml, "member dependency")
 
+          version_update_reports = {}
+          for dep_name, candidates in sorted(version_candidates.items()):
+              target_entry = target_workspace_deps.get(dep_name)
+              if not target_entry:
+                  continue
+              target_value = dependency_table(target_entry)
+              target_req = version_req(target_value)
+              target_parsed = parse_simple_version_req(target_req) if target_req else None
+              if not target_parsed:
+                  continue
+
+              chosen = {
+                  "tuple": target_parsed["tuple"],
+                  "version": target_parsed["normalized"],
+                  "source": "generated root",
+              }
+              for candidate in candidates:
+                  parsed = candidate["source_parsed"]
+                  if parsed["tuple"] > chosen["tuple"]:
+                      chosen = {
+                          "tuple": parsed["tuple"],
+                          "version": parsed["normalized"],
+                          "source": candidate["package"],
+                      }
+
+              if chosen["tuple"] <= target_parsed["tuple"]:
+                  continue
+
+              replacement_entry = update_workspace_entry_version(target_entry, dep_name, chosen["version"])
+              if replacement_entry == target_entry:
+                  version_skips.append((dep_name, "generated root", "root update", chosen["version"], target_req, "could not rewrite root workspace entry"))
+                  continue
+
+              root_text, replaced = replace_workspace_dependency_entry(root_text, dep_name, replacement_entry)
+              if not replaced:
+                  version_skips.append((dep_name, "generated root", "root update", chosen["version"], target_req, "could not find root workspace entry"))
+                  continue
+
+              target_workspace_deps[dep_name] = replacement_entry
+              requested = sorted({f"{candidate['package']}: {candidate['source_req']}" for candidate in candidates})
+              version_update_reports[dep_name] = {
+                  "packages": sorted({candidate["package"] for candidate in candidates}),
+                  "before": dependency_summary(target_entry),
+                  "requested": "; ".join(requested),
+                  "after": dependency_summary(replacement_entry),
+                  "result": f"root workspace version raised to {chosen['version']}",
+              }
+              print(f"Raised root workspace dependency {dep_name}: {target_req} -> {chosen['version']}")
+
+          if version_update_reports:
+              root_path.write_text(root_text)
+              target_workspace_deps = parse_dependency_entries(
+                  extract_section(root_text, "workspace.dependencies")
+              )
+
+          def source_dependency_value_for_manifest(source_entry: str, dep_name: str, manifest: Path) -> dict:
+              source_value = dependency_table(source_entry)
+              value = {
+                  key: val
+                  for key, val in source_value.items()
+                  if not key.startswith("__")
+              }
+
+              git_url = value.get("git")
+              package = value.get("package", dep_name)
+              if isinstance(git_url, str) and "github.com/zed-industries/" in git_url:
+                  local_path = local_packages.get(package)
+                  if local_path:
+                      relative_path = os.path.relpath(local_path, manifest.parent).replace(os.sep, "/")
+                      value = {
+                          key: val
+                          for key, val in value.items()
+                          if key not in {"git", "rev", "tag", "branch", "version"}
+                      }
+                      value["path"] = relative_path
+                      if package != dep_name:
+                          value["package"] = package
+                      print(f"Rewrote {dep_name} for {manifest}: zed-industries git -> {relative_path}")
+                  else:
+                      print(f"No local Zed package for {dep_name} / {package}; keeping source dependency.")
+
+              return value
+
+          def expanded_dependency_line(dep_name: str, source_entry: str, original_entry: str, manifest: Path) -> str:
+              indent_match = re.match(r'^(\s*)', original_entry)
+              indent = indent_match.group(1) if indent_match else ""
+              value = source_dependency_value_for_manifest(source_entry, dep_name, manifest)
+              original_value = dependency_entry_table(original_entry, dep_name)
+
+              merged_features = merge_ordered_features(
+                  ordered_features(value),
+                  ordered_features(original_value),
+              )
+              if merged_features:
+                  value["features"] = merged_features
+              elif "features" in value:
+                  value.pop("features", None)
+
+              if "optional" in original_value:
+                  value["optional"] = original_value["optional"]
+              if "default-features" in original_value:
+                  value["default-features"] = original_value["default-features"]
+
+              return render_dependency_line(dep_name, value, indent)
+
+          def inherited_dependency_line(dep_name: str, original_entry: str, extra_features: list[str]) -> str:
+              if not extra_features:
+                  return original_entry
+              indent_match = re.match(r'^(\s*)', original_entry)
+              indent = indent_match.group(1) if indent_match else ""
+              value = dependency_entry_table(original_entry, dep_name)
+              if value.get("workspace") is not True:
+                  return original_entry
+
+              merged_features = merge_ordered_features(
+                  ordered_features(value),
+                  extra_features,
+              )
+              value = {
+                  key: val
+                  for key, val in value.items()
+                  if not key.startswith("__")
+              }
+              value["workspace"] = True
+              value["features"] = merged_features
+
+              # Keep the workspace flag first for readability.
+              ordered = {"workspace": True}
+              for key, val in value.items():
+                  if key != "workspace":
+                      ordered[key] = val
+              return render_dependency_line(dep_name, ordered, indent)
+
+          def direct_dependency_can_inherit(dep_name: str, original_entry: str, target_entry: str):
+              original_value = dependency_entry_table(original_entry, dep_name)
+              target_value = dependency_table(target_entry)
+
+              if original_value.get("workspace") is True:
+                  return None
+              if not is_plain_registry_dependency(original_value) or not is_plain_registry_dependency(target_value):
+                  return None
+              if package_name(original_value) != package_name(target_value):
+                  return None
+              if default_features(original_value) != default_features(target_value):
+                  return None
+
+              original_req = version_req(original_value)
+              target_req = version_req(target_value)
+              original_parsed = parse_simple_version_req(original_req) if original_req else None
+              target_parsed = parse_simple_version_req(target_req) if target_req else None
+              if not original_parsed or not target_parsed:
+                  return None
+              if compatibility_lane(original_parsed) != compatibility_lane(target_parsed):
+                  return None
+              if target_parsed["tuple"] < original_parsed["tuple"]:
+                  return None
+
+              extra_features = [
+                  feature
+                  for feature in ordered_features(original_value)
+                  if feature not in feature_set(target_value)
+              ]
+              inherited = {"workspace": True}
+              if extra_features:
+                  inherited["features"] = extra_features
+              if "optional" in original_value:
+                  inherited["optional"] = original_value["optional"]
+              return inherited
+
+          alignment_reports = {}
+
+          def record_alignment(dep_name: str, source_entry: str, target_entry: str, cargo_toml: Path, result: str):
+              source_summary = dependency_summary(source_entry)
+              target_summary = dependency_summary(target_entry)
+              # Keep the summary focused on intentional source-vs-root differences.
+              if source_summary == target_summary and result == "aligned to target root workspace dependency":
+                  return
+              key = (dep_name, source_summary, target_summary, result)
+              alignment_reports.setdefault(key, set()).add(package_name_for_manifest(cargo_toml))
+
+          for item in crates.values():
+              target = Path(item["target"])
               for cargo_toml in target.rglob("Cargo.toml"):
                   text = cargo_toml.read_text()
                   original = text
 
-                  for dep_name in source_dep_names:
-                      source_entry = source_deps[dep_name]
-                      replacement = rewrite_zed_git_dependency_to_local_for_manifest(
-                          source_entry,
-                          cargo_toml,
+                  for dep_name, source_entry in source_deps.items():
+                      if dep_name in imported_packages:
+                          continue
+
+                      target_entry = target_workspace_deps.get(dep_name)
+                      if should_expand_source_workspace_dep(dep_name, source_entry):
+                          text, _ = rewrite_workspace_dependency_entries(
+                              text,
+                              dep_name,
+                              lambda original_entry, dep_name=dep_name, source_entry=source_entry, cargo_toml=cargo_toml:
+                                  expanded_dependency_line(dep_name, source_entry, original_entry, cargo_toml),
+                          )
+                          continue
+
+                      source_value = dependency_table(source_entry)
+                      target_value = dependency_table(target_entry)
+                      target_features = feature_set(target_value)
+                      inherited_extra_feature_rows = []
+
+                      def workspace_inherit_rewriter(original_entry, dep_name=dep_name, source_value=source_value, target_features=target_features):
+                          original_value = dependency_entry_table(original_entry, dep_name)
+                          required_extra_features = [
+                              feature
+                              for feature in merge_ordered_features(
+                                  ordered_features(source_value),
+                                  ordered_features(original_value),
+                              )
+                              if feature not in target_features
+                          ]
+                          inherited_extra_feature_rows.append(required_extra_features)
+                          return inherited_dependency_line(dep_name, original_entry, required_extra_features)
+
+                      text, replaced = rewrite_workspace_dependency_entries(
+                          text,
+                          dep_name,
+                          workspace_inherit_rewriter,
                       )
-                      text = replace_workspace_dep_line(text, dep_name, replacement)
+                      if replaced:
+                          extra_features = merge_ordered_features(*inherited_extra_feature_rows)
+                          result = "aligned to target root workspace dependency"
+                          if extra_features:
+                              result += "; member adds or keeps missing features " + ", ".join(extra_features)
+                          record_alignment(
+                              dep_name,
+                              source_entry,
+                              target_entry,
+                              cargo_toml,
+                              result,
+                          )
+
+                  # Convert direct external dependencies to workspace inheritance only
+                  # after the root has been raised to the highest compatible imported
+                  # version. This keeps normal registry deps centralized while leaving
+                  # git/path/default-features/incompatible ranges explicit.
+                  for dep_name, target_entry in sorted(target_workspace_deps.items()):
+                      if dep_name in imported_packages or dep_name == "gpui":
+                          continue
+
+                      def direct_rewriter(original_entry: str, dep_name=dep_name, target_entry=target_entry, cargo_toml=cargo_toml):
+                          original_value = dependency_entry_table(original_entry, dep_name)
+                          if original_value.get("workspace") is True:
+                              return None
+                          inherited = direct_dependency_can_inherit(dep_name, original_entry, target_entry)
+                          if inherited is None:
+                              return None
+                          indent_match = re.match(r'^(\s*)', original_entry)
+                          indent = indent_match.group(1) if indent_match else ""
+                          line = render_dependency_line(dep_name, inherited, indent)
+                          result = "direct member dependency converted to workspace inheritance"
+                          if inherited.get("features"):
+                              result += "; member adds missing features " + ", ".join(inherited["features"])
+                          if inherited.get("optional") is True:
+                              result += "; optional=true preserved"
+                          record_alignment(
+                              dep_name,
+                              original_entry,
+                              target_entry,
+                              cargo_toml,
+                              result,
+                          )
+                          return line
+
+                      text, _ = rewrite_dependency_entries_in_dependency_sections(text, dep_name, direct_rewriter)
 
                   if text != original:
                       cargo_toml.write_text(text)
-                      print(f"Expanded source workspace dependencies in {cargo_toml}")
+                      print(f"Aligned source workspace dependencies in {cargo_toml}")
 
-      - name: Remove nested workspace metadata from imported crates
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              def compact_action(result: str, root_changed: bool) -> str:
+                  actions = []
+                  if root_changed:
+                      actions.append("raise root")
+                  if result.startswith("direct member dependency converted to workspace inheritance"):
+                      actions.append("member -> workspace")
+                  elif result.startswith("aligned to target root workspace dependency"):
+                      actions.append("inherit root")
+                  elif result:
+                      actions.append(result)
+
+                  feature_match = re.search(
+                      r'member (?:adds or keeps missing features|adds missing features) (.+?)(?:;|$)',
+                      result,
+                  )
+                  if feature_match:
+                      actions.append("member features: " + feature_match.group(1).strip())
+                  if "optional=true preserved" in result:
+                      actions.append("optional kept")
+
+                  compact = []
+                  seen = set()
+                  for action in actions:
+                      if action and action not in seen:
+                          compact.append(action)
+                          seen.add(action)
+                  return "; ".join(compact) if compact else "no change"
+
+              def final_member_summary(result: str) -> str:
+                  if (
+                      result.startswith("direct member dependency converted to workspace inheritance")
+                      or result.startswith("aligned to target root workspace dependency")
+                  ):
+                      parts = ["workspace"]
+                      feature_match = re.search(
+                          r'member (?:adds or keeps missing features|adds missing features) (.+?)(?:;|$)',
+                          result,
+                      )
+                      if feature_match:
+                          parts.append("features [" + feature_match.group(1).strip() + "]")
+                      if "optional=true preserved" in result:
+                          parts.append("optional")
+                      return "; ".join(parts)
+                  return "explicit"
+
+              rows = []
+              aligned_deps = set()
+
+              for (dep_name, source_summary, target_summary, result), packages in alignment_reports.items():
+                  aligned_deps.add(dep_name)
+                  root_update = version_update_reports.get(dep_name)
+                  root_original = root_update["before"] if root_update else target_summary
+                  root_final = target_summary
+                  root_changed = bool(root_update)
+                  rows.append({
+                      "dep": dep_name,
+                      "packages": ", ".join(sorted(packages)),
+                      "root_original": root_original,
+                      "sub_original": source_summary,
+                      "action": compact_action(result, root_changed),
+                      "root_final": root_final,
+                      "member_final": final_member_summary(result),
+                  })
+
+              for dep_name, item in version_update_reports.items():
+                  if dep_name in aligned_deps:
+                      continue
+                  rows.append({
+                      "dep": dep_name,
+                      "packages": ", ".join(item["packages"]),
+                      "root_original": item["before"],
+                      "sub_original": item["requested"],
+                      "action": "raise root",
+                      "root_final": item["after"],
+                      "member_final": "unchanged",
+                  })
+
+              for dep_name, package, origin, source_req, target_req, reason in sorted(set(version_skips)):
+                  rows.append({
+                      "dep": dep_name,
+                      "packages": package,
+                      "root_original": target_req,
+                      "sub_original": source_req,
+                      "action": "explicit: " + reason,
+                      "root_final": target_req,
+                      "member_final": "explicit",
+                  })
+
+              rows.sort(key=lambda row: (row["dep"], row["packages"], row["action"], row["sub_original"]))
+
+              with Path(summary_path).open("a") as summary:
+                  summary.write("\n### Workspace dependency resolving\n")
+                  summary.write("Rule: compatible newer sub-crate version raises root; safe deps use workspace; unsafe deps stay explicit.\n\n")
+                  if rows:
+                      summary.write("| Dependency | Package(s) | Root original | Sub-crate original | Action | Root final | Member final |\n")
+                      summary.write("|---|---|---|---|---|---|---|\n")
+                      for row in rows[:160]:
+                          summary.write(
+                              "| "
+                              + markdown_cell(row["dep"])
+                              + " | "
+                              + markdown_cell(row["packages"])
+                              + " | "
+                              + markdown_cell(row["root_original"])
+                              + " | "
+                              + markdown_cell(row["sub_original"])
+                              + " | "
+                              + markdown_cell(row["action"])
+                              + " | "
+                              + markdown_cell(row["root_final"])
+                              + " | "
+                              + markdown_cell(row["member_final"])
+                              + " |\n"
+                          )
+                      if len(rows) > 160:
+                          summary.write(f"\nOnly the first 160 dependency resolving rows are shown out of {len(rows)}.\n")
+                  else:
+                      summary.write("No dependency resolving changes.\n")
+
+      - name: Remove nested workspace metadata from imported packages
+        env:
+          CRATES_JSON: ${{ steps.detect.outputs.crates_json }}
         shell: python
         run: |
           from pathlib import Path
           import json
+          import os
           import re
 
-          crates = json.loads(r'''${{ steps.detect.outputs.crates_json }}''')
+          crates = json.loads(os.environ["CRATES_JSON"])
 
           for item in crates.values():
-              toml = Path(item["target"]) / "Cargo.toml"
+              target = Path(item["target"])
+              for toml in target.rglob("Cargo.toml"):
+                  text = toml.read_text()
+                  original = text
 
-              if not toml.exists():
-                  continue
+                  text = re.sub(r'(?ms)^\[workspace\]\s*.*?(?=^\[|\Z)', '', text)
+                  text = re.sub(r'(?ms)^\[workspace\.dependencies\]\s*.*?(?=^\[|\Z)', '', text)
 
-              text = toml.read_text()
-
-              text = re.sub(
-                  r'(?ms)^\[workspace\]\s*.*?(?=^\[|\Z)',
-                  '',
-                  text,
-              )
-
-              text = re.sub(
-                  r'(?ms)^\[workspace\.dependencies\]\s*.*?(?=^\[|\Z)',
-                  '',
-                  text,
-              )
-
-              toml.write_text(text)
+                  if text != original:
+                      toml.write_text(text)
+                      print(f"Removed nested workspace metadata from {toml}")
 
       - name: Patch imported local package dependencies to workspace dependencies
+        env:
+          CRATES_JSON: ${{ steps.detect.outputs.crates_json }}
         shell: python
         run: |
           from pathlib import Path
           import json
+          import os
           import re
 
-          crates = json.loads(r'''${{ steps.detect.outputs.crates_json }}''')
-
+          crates = json.loads(os.environ["CRATES_JSON"])
           imported_packages = set(crates.keys())
-          packages_to_patch = imported_packages
+          imported_targets = {
+              name: Path(item["target"])
+              for name, item in crates.items()
+          }
+
+          def extract_inline_value(body: str, key: str):
+              if key == "features":
+                  match = re.search(r'features\s*=\s*\[([^\]]*)\]', body, re.S)
+                  return "[" + match.group(1).strip() + "]" if match else None
+              match = re.search(rf'{re.escape(key)}\s*=\s*("[^"]*"|true|false)', body)
+              return match.group(1) if match else None
+
+          def rewrite_inline_table(cargo_toml: Path, dep_name: str, body: str) -> str:
+              package_value = extract_inline_value(body, "package")
+              package_name = package_value.strip('"') if package_value else dep_name
+
+              keep = []
+              if package_value:
+                  keep.append(f'package = {package_value}')
+
+              features_value = extract_inline_value(body, "features")
+              if features_value:
+                  keep.append(f"features = {features_value}")
+
+              default_features_value = extract_inline_value(body, "default-features")
+              optional_value = extract_inline_value(body, "optional")
+
+              # Cargo does not allow member crates to inherit a workspace dependency
+              # and override default-features there. Preserve the original per-crate
+              # behavior by keeping those dependencies as explicit local path deps.
+              if default_features_value is not None:
+                  target = imported_targets.get(package_name)
+                  if target is None:
+                      target = imported_targets.get(dep_name)
+                  if target is None:
+                      raise SystemExit(
+                          f"Cannot resolve imported dependency target for {dep_name} / {package_name} in {cargo_toml}"
+                      )
+                  relative_path = os.path.relpath(target, cargo_toml.parent).replace(os.sep, "/")
+                  parts = [f'path = "{relative_path}"'] + keep + [
+                      f"default-features = {default_features_value}"
+                  ]
+                  if optional_value is not None:
+                      parts.append(f"optional = {optional_value}")
+                  return f'{dep_name} = {{ ' + ", ".join(parts) + " }"
+
+              if optional_value is not None:
+                  keep.append(f"optional = {optional_value}")
+
+              parts = ["workspace = true"] + keep
+              return f'{dep_name} = {{ ' + ", ".join(parts) + " }"
 
           def patch_dependency_to_workspace(cargo_toml: Path, crate_name: str):
               text = cargo_toml.read_text()
-
-              text = re.sub(
-                  rf'(?m)^\s*{re.escape(crate_name)}\s*=\s*\{{[^\n]*\}}\s*$',
-                  f'{crate_name}.workspace = true',
-                  text,
-              )
+              original = text
 
               text = re.sub(
                   rf'(?m)^\s*{re.escape(crate_name)}\s*=\s*"[^"]+"\s*$',
@@ -448,66 +1823,277 @@ jobs:
                   text,
               )
 
-              cargo_toml.write_text(text)
+              def repl(match):
+                  return rewrite_inline_table(cargo_toml, crate_name, match.group(1))
+
+              text = re.sub(
+                  rf'(?ms)^\s*{re.escape(crate_name)}\s*=\s*\{{([^\n]*)\}}\s*$',
+                  repl,
+                  text,
+              )
+
+              if text != original:
+                  cargo_toml.write_text(text)
+                  print(f"Patched local dependency {crate_name} in {cargo_toml}")
 
           for item in crates.values():
               target = Path(item["target"])
-
               for cargo_toml in target.rglob("Cargo.toml"):
-                  for package in packages_to_patch:
+                  for package in imported_packages:
                       patch_dependency_to_workspace(cargo_toml, package)
 
-      - name: Force gpui-component to use local gpui_facade package
-        shell: python
-        run: |
-          from pathlib import Path
-          import re
-
-          cargo_toml = Path("crates/gpui_component/Cargo.toml")
-
-          if not cargo_toml.exists():
-              raise SystemExit("crates/gpui_component/Cargo.toml not found")
-
-          text = cargo_toml.read_text()
-
-          replacement = 'gpui = { package = "gpui_facade", path = "../gpui_facade", features = ["gpui_macos", "gpui_web", "gpui_macros", "font-kit", "x11", "wayland", "runtime_shaders"] }'
-
-          text = re.sub(
-              r'(?m)^\s*gpui\.workspace\s*=\s*true\s*$\n?',
-              '',
-              text,
-          )
-
-          text = re.sub(
-              r'(?m)^\s*gpui\s*=\s*"[^"]+"\s*$\n?',
-              '',
-              text,
-          )
-
-          text = re.sub(
-              r'(?m)^\s*gpui\s*=\s*\{[^\n]*\}\s*$\n?',
-              '',
-              text,
-          )
-
-          dependencies_match = re.search(r'(?m)^\[dependencies\]\s*$', text)
-
-          if not dependencies_match:
-              text += "\n[dependencies]\n" + replacement + "\n"
-          else:
-              insert_at = dependencies_match.end()
-              text = text[:insert_at] + "\n" + replacement + text[insert_at:]
-
-          cargo_toml.write_text(text)
-
-      - name: Apply gpui-unofficial-style modifications
+      - name: Force imported packages to use local gpui_facade package
+        env:
+          CRATES_JSON: ${{ steps.detect.outputs.crates_json }}
         shell: python
         run: |
           from pathlib import Path
           import json
+          import os
           import re
 
-          crates = json.loads(r'''${{ steps.detect.outputs.crates_json }}''')
+          crates = json.loads(os.environ["CRATES_JSON"])
+          facade_root = Path("crates/gpui_facade")
+
+          # Features that are safe and useful for every target using the facade.
+          BASE_FEATURES = ["gpui_macros"]
+          TEST_FEATURES = ["test-support"]
+
+          # Keep platform/native dependencies target-scoped instead of enabling all
+          # facade platform edges in every imported package on every target.
+          TARGET_FEATURES = {
+              'target.\'cfg(target_family = "wasm")\'.dependencies': [
+                  "gpui_web",
+              ],
+              'target.\'cfg(target_os = "macos")\'.dependencies': [
+                  "gpui_macos",
+                  "font-kit",
+                  "runtime_shaders",
+              ],
+              'target.\'cfg(any(target_os = "linux", target_os = "freebsd"))\'.dependencies': [
+                  "gpui_linux",
+                  "x11",
+                  "wayland",
+                  "font-kit",
+                  "runtime_shaders",
+              ],
+              'target.\'cfg(target_os = "windows")\'.dependencies': [
+                  "gpui_windows",
+                  "font-kit",
+                  "runtime_shaders",
+                  "windows-manifest",
+              ],
+          }
+
+          PLATFORM_OR_DEFAULT_FEATURES = {
+              "gpui_web",
+              "gpui_web_multithreaded",
+              "gpui_macos",
+              "gpui_linux",
+              "gpui_windows",
+              "font-kit",
+              "x11",
+              "wayland",
+              "runtime_shaders",
+              "windows-manifest",
+          }
+
+          def unique(values):
+              seen = set()
+              out = []
+              for value in values:
+                  if value in seen:
+                      continue
+                  seen.add(value)
+                  out.append(value)
+              return out
+
+          def quote_list(values):
+              return "[" + ", ".join(f'"{value}"' for value in unique(values)) + "]"
+
+          def gpui_entry(cargo_toml: Path, features: list[str]) -> str:
+              relative_path = os.path.relpath(facade_root, cargo_toml.parent).replace(os.sep, "/")
+              return (
+                  'gpui = { package = "gpui_facade", '
+                  f'path = "{relative_path}", '
+                  'default-features = false, '
+                  f'features = {quote_list(features)} }}'
+              )
+
+          def section_bounds(text: str, section_name: str):
+              header = re.search(rf'(?m)^\[{re.escape(section_name)}\][^\S\r\n]*$', text)
+              if not header:
+                  return None
+              body_start = header.end()
+              if body_start < len(text) and text[body_start] == "\n":
+                  body_start += 1
+              next_header = re.search(r'(?m)^\[', text[body_start:])
+              section_end = body_start + next_header.start() if next_header else len(text)
+              return header.start(), header.end(), body_start, section_end
+
+          def ensure_section(text: str, section_name: str) -> str:
+              if section_bounds(text, section_name):
+                  return text
+              suffix = "" if text.endswith("\n") else "\n"
+              return text + suffix + f"\n[{section_name}]\n"
+
+          def dependency_section_names(text: str) -> list[str]:
+              names = []
+              for match in re.finditer(r'(?m)^\[([^\]]+)\][^\S\r\n]*$', text):
+                  name = match.group(1)
+                  if name == "workspace.dependencies":
+                      continue
+                  if name in {"dependencies", "dev-dependencies"}:
+                      names.append(name)
+                  elif name.startswith("target.") and name.endswith((".dependencies", ".dev-dependencies")):
+                      names.append(name)
+              return names
+
+          def take_named_entries(section: str, key: str):
+              lines = section.splitlines(keepends=True)
+              kept = []
+              removed = []
+              i = 0
+              while i < len(lines):
+                  line = lines[i]
+                  stripped = line.strip()
+                  if re.match(rf'^{re.escape(key)}(?:\.workspace\s*=|\s*=)', stripped):
+                      current = []
+                      depth_curly = 0
+                      depth_square = 0
+                      while i < len(lines):
+                          current.append(lines[i])
+                          code = lines[i].split("#", 1)[0]
+                          depth_curly += code.count("{") - code.count("}")
+                          depth_square += code.count("[") - code.count("]")
+                          i += 1
+                          if depth_curly <= 0 and depth_square <= 0:
+                              break
+                      removed.append("".join(current))
+                      continue
+                  kept.append(line)
+                  i += 1
+              return "".join(kept), removed
+
+          def remove_gpui_from_section(text: str, section_name: str):
+              bounds = section_bounds(text, section_name)
+              if not bounds:
+                  return text, []
+              _, _, body_start, section_end = bounds
+              section, removed = take_named_entries(text[body_start:section_end], "gpui")
+              return text[:body_start] + section + text[section_end:], removed
+
+          def split_trailing_blank_lines(section: str) -> tuple[str, str]:
+              lines = section.splitlines(keepends=True)
+              index = len(lines)
+              while index > 0 and lines[index - 1].strip() == "":
+                  index -= 1
+              return "".join(lines[:index]), "".join(lines[index:])
+
+          def set_key_in_section(text: str, section_name: str, key: str, line: str) -> str:
+              text = ensure_section(text, section_name)
+              bounds = section_bounds(text, section_name)
+              if not bounds:
+                  raise SystemExit(f"Could not find [{section_name}] after creating it")
+              _, _, body_start, section_end = bounds
+              section, _ = take_named_entries(text[body_start:section_end], key)
+              body, trailing_blank = split_trailing_blank_lines(section)
+              if body and not body.endswith("\n"):
+                  body += "\n"
+              body += line + "\n"
+
+              # If the section is immediately followed by another header and had
+              # no blank separator, add one. If it already had trailing blank
+              # lines, preserve them and insert the dependency before them.
+              if not trailing_blank and section_end < len(text):
+                  trailing_blank = "\n"
+
+              section = body + trailing_blank
+              return text[:body_start] + section + text[section_end:]
+
+          def insert_or_replace_key(text: str, section_name: str, line: str) -> str:
+              key = line.split("=", 1)[0].strip()
+              return set_key_in_section(text, section_name, key, line)
+
+          def features_from_entries(entries: list[str]) -> list[str]:
+              features = []
+              for entry in entries:
+                  for match in re.finditer(r'features\s*=\s*\[(.*?)\]', entry, re.S):
+                      features.extend(re.findall(r'"([^"]+)"', match.group(1)))
+              return unique(features)
+
+          def force_gpui(cargo_toml: Path):
+              text = cargo_toml.read_text()
+              original = text
+              removed_entries = []
+
+              for section_name in dependency_section_names(text):
+                  text, removed = remove_gpui_from_section(text, section_name)
+                  removed_entries.extend(removed)
+
+              if not removed_entries:
+                  return
+
+              existing_features = features_from_entries(removed_entries)
+              common_features = [
+                  feature
+                  for feature in existing_features
+                  if feature not in PLATFORM_OR_DEFAULT_FEATURES and feature not in TEST_FEATURES
+              ]
+              common_features = unique(BASE_FEATURES + common_features)
+
+              text = insert_or_replace_key(
+                  text,
+                  "dependencies",
+                  gpui_entry(cargo_toml, common_features),
+              )
+
+              for section_name, features in TARGET_FEATURES.items():
+                  target_features = list(features)
+                  if section_name.startswith('target.\'cfg(target_family = "wasm")') and "gpui_web_multithreaded" in existing_features:
+                      target_features.append("gpui_web_multithreaded")
+                  text = insert_or_replace_key(
+                      text,
+                      section_name,
+                      gpui_entry(cargo_toml, target_features),
+                  )
+
+              # Test-only opt-in for imported packages whose tests use #[gpui::test].
+              # Cargo activates dev-dependencies only for tests/examples/benches, so
+              # normal users are not affected by this feature.
+              text = insert_or_replace_key(
+                  text,
+                  "features",
+                  'test-support = ["gpui/test-support"]',
+              )
+              text = insert_or_replace_key(
+                  text,
+                  "dev-dependencies",
+                  gpui_entry(cargo_toml, unique(common_features + TEST_FEATURES)),
+              )
+
+              if text != original:
+                  cargo_toml.write_text(text)
+                  print(f"Forced gpui dependency to local gpui_facade in {cargo_toml}")
+                  print(f"Moved platform-specific gpui_facade features into target-specific dependency tables in {cargo_toml}")
+                  print(f"Enabled test-only gpui_facade/test-support for {cargo_toml}")
+
+          for item in crates.values():
+              target = Path(item["target"])
+              for cargo_toml in target.rglob("Cargo.toml"):
+                  force_gpui(cargo_toml)
+
+      - name: Apply gpui-unofficial-style modifications
+        env:
+          CRATES_JSON: ${{ steps.detect.outputs.crates_json }}
+        shell: python
+        run: |
+          from pathlib import Path
+          import json
+          import os
+          import re
+
+          crates = json.loads(os.environ["CRATES_JSON"])
 
           imported_roots = [
               Path(item["target"])
@@ -532,10 +2118,7 @@ jobs:
 
           for root in imported_roots:
               for path in root.rglob("*"):
-                  if not path.is_file():
-                      continue
-
-                  if not is_text_file(path):
+                  if not path.is_file() or not is_text_file(path):
                       continue
 
                   try:
@@ -544,7 +2127,6 @@ jobs:
                       continue
 
                   original = text
-
                   text = text.replace("gpui_platform::", "gpui::gpui_platform::")
                   text = text.replace("gpui_web::", "gpui::gpui_web::")
                   text = text.replace("gpui_macros::", "gpui::gpui_macros::")
@@ -557,34 +2139,18 @@ jobs:
               original = text
 
               for dep in ["gpui_platform", "gpui_web", "gpui_macros"]:
-                  text = re.sub(
-                      rf'(?m)^\s*{re.escape(dep)}\.workspace\s*=\s*true\s*\n',
-                      '',
-                      text,
-                  )
-
-                  text = re.sub(
-                      rf'(?m)^\s*{re.escape(dep)}\s*=\s*\{{[^\n]*\}}\s*\n',
-                      '',
-                      text,
-                  )
-
-                  text = re.sub(
-                      rf'(?m)^\s*{re.escape(dep)}\s*=\s*"[^"]+"\s*\n',
-                      '',
-                      text,
-                  )
+                  text = re.sub(rf'(?m)^\s*{re.escape(dep)}\.workspace\s*=\s*true\s*\n', '', text)
+                  text = re.sub(rf'(?m)^\s*{re.escape(dep)}\s*=\s*\{{[^\n]*\}}\s*\n', '', text)
+                  text = re.sub(rf'(?m)^\s*{re.escape(dep)}\s*=\s*"[^"]+"\s*\n', '', text)
 
               text = text.replace(
                   'inspector = ["gpui_macros/inspector", "gpui/inspector"]',
                   'inspector = ["gpui/inspector"]',
               )
-
               text = text.replace(
                   'inspector = ["gpui/inspector", "gpui_macros/inspector"]',
                   'inspector = ["gpui/inspector"]',
               )
-
               text = re.sub(
                   r"(?ms)^\[target\.'cfg\(target_family = \"wasm\"\)'\.dependencies\]\s*(?=^\[|\Z)",
                   "",
@@ -598,19 +2164,361 @@ jobs:
               for cargo_toml in root.rglob("Cargo.toml"):
                   remove_direct_split_crate_deps(cargo_toml)
 
-      - name: Validate generated branch
+      - name: Prune unused root workspace dependencies
+        shell: python
+        run: |
+          from collections import deque
+          from pathlib import Path
+          import os
+          import re
+          import tomllib
+
+          root = Path("Cargo.toml")
+          if not root.exists():
+              raise SystemExit("Missing root Cargo.toml")
+
+          root_text = root.read_text()
+          root_data = tomllib.loads(root_text)
+          workspace = root_data.get("workspace", {})
+          workspace_deps = workspace.get("dependencies", {})
+          if not isinstance(workspace_deps, dict) or not workspace_deps:
+              print("No root [workspace.dependencies] entries to prune.")
+              raise SystemExit(0)
+
+          def dependency_tables(data: dict):
+              for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+                  table = data.get(section, {})
+                  if isinstance(table, dict):
+                      yield table
+
+              target = data.get("target", {})
+              if isinstance(target, dict):
+                  for target_table in target.values():
+                      if not isinstance(target_table, dict):
+                          continue
+                      for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+                          table = target_table.get(section, {})
+                          if isinstance(table, dict):
+                              yield table
+
+          def package_name(dep_name: str, dep_value):
+              if isinstance(dep_value, dict) and isinstance(dep_value.get("package"), str):
+                  return dep_value["package"]
+              return dep_name
+
+          def dep_path(dep_value):
+              if isinstance(dep_value, dict) and isinstance(dep_value.get("path"), str):
+                  return dep_value["path"]
+              return None
+
+          def normalize_dep_value(dep_value):
+              if isinstance(dep_value, str):
+                  return {"version": dep_value}
+              if isinstance(dep_value, dict):
+                  return dep_value
+              return {}
+
+          def is_workspace_dep(dep_value) -> bool:
+              return isinstance(dep_value, dict) and dep_value.get("workspace") is True
+
+          def expand_member_manifest_paths(pattern: str) -> list[Path]:
+              pattern = pattern.strip()
+              if not pattern:
+                  return []
+              if any(char in pattern for char in "*?["):
+                  return sorted(Path(".").glob(f"{pattern}/Cargo.toml"))
+              candidate = Path(pattern) / "Cargo.toml"
+              return [candidate] if candidate.exists() else []
+
+          initial_manifests = []
+          members = workspace.get("members", [])
+          if isinstance(members, list):
+              for member in members:
+                  if isinstance(member, str):
+                      initial_manifests.extend(expand_member_manifest_paths(member))
+
+          def canonical(path: Path) -> Path:
+              return path.resolve(strict=False)
+
+          queue = deque(canonical(path) for path in initial_manifests)
+          visited_manifests = set()
+          used_workspace_deps = set()
+
+          while queue:
+              manifest = queue.popleft()
+              if manifest in visited_manifests or not manifest.exists():
+                  continue
+              visited_manifests.add(manifest)
+
+              try:
+                  data = tomllib.loads(manifest.read_text())
+              except Exception as exc:
+                  print(f"Skipping unreadable manifest {manifest}: {exc}")
+                  continue
+
+              manifest_dir = manifest.parent
+              for table in dependency_tables(data):
+                  for dep_name, dep_value in table.items():
+                      effective_value = dep_value
+                      base_dir = manifest_dir
+                      if is_workspace_dep(dep_value):
+                          if dep_name not in workspace_deps:
+                              continue
+                          used_workspace_deps.add(dep_name)
+                          effective_value = workspace_deps[dep_name]
+                          # Paths inside root [workspace.dependencies] are resolved
+                          # relative to the workspace root, not the inheriting
+                          # package manifest.
+                          base_dir = Path(".")
+
+                      effective_value = normalize_dep_value(effective_value)
+                      local_path = dep_path(effective_value)
+                      if not local_path:
+                          continue
+
+                      candidate = canonical(base_dir / local_path / "Cargo.toml")
+                      if candidate.exists() and candidate not in visited_manifests:
+                          queue.append(candidate)
+
+          unused_workspace_deps = set(workspace_deps) - used_workspace_deps
+          if not unused_workspace_deps:
+              print("No unused root [workspace.dependencies] entries found.")
+              raise SystemExit(0)
+
+          def section_bounds(text: str, section_name: str):
+              header = re.search(rf'(?m)^\[{re.escape(section_name)}\][^\S\r\n]*$', text)
+              if not header:
+                  return None
+              body_start = header.end()
+              if body_start < len(text) and text[body_start] == "\n":
+                  body_start += 1
+              next_header = re.search(r'(?m)^\[', text[body_start:])
+              section_end = body_start + next_header.start() if next_header else len(text)
+              return body_start, section_end
+
+          def remove_dependency_entries(section: str, names_to_remove: set[str]) -> tuple[str, list[str]]:
+              lines = section.splitlines(keepends=True)
+              kept = []
+              removed = []
+              i = 0
+              while i < len(lines):
+                  line = lines[i]
+                  stripped = line.strip()
+                  match = re.match(r'^([A-Za-z0-9_\-]+)\s*=', stripped)
+                  if not match or match.group(1) not in names_to_remove:
+                      kept.append(line)
+                      i += 1
+                      continue
+
+                  key = match.group(1)
+                  current = []
+                  depth_curly = 0
+                  depth_square = 0
+                  while i < len(lines):
+                      current.append(lines[i])
+                      code = lines[i].split("#", 1)[0]
+                      depth_curly += code.count("{") - code.count("}")
+                      depth_square += code.count("[") - code.count("]")
+                      i += 1
+                      if depth_curly <= 0 and depth_square <= 0:
+                          break
+                  removed.append(key)
+
+              return "".join(kept), removed
+
+          bounds = section_bounds(root_text, "workspace.dependencies")
+          if not bounds:
+              print("No [workspace.dependencies] section found to prune.")
+              raise SystemExit(0)
+
+          body_start, section_end = bounds
+          section, removed = remove_dependency_entries(
+              root_text[body_start:section_end],
+              unused_workspace_deps,
+          )
+
+          if not removed:
+              print("No removable unused root [workspace.dependencies] entries found.")
+              raise SystemExit(0)
+
+          root.write_text(root_text[:body_start] + section + root_text[section_end:])
+          print(
+              f"Pruned {len(removed)} unused root [workspace.dependencies] entries "
+              f"after graph search from {len(initial_manifests)} workspace member manifests."
+          )
+          print("Removed workspace dependencies:")
+          for name in sorted(removed):
+              print(f"  {name}")
+
+      - name: Verify Linux native build dependencies
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
-          cargo metadata --no-deps
+          pkg-config --modversion gdk-3.0
+          pkg-config --modversion gdk-pixbuf-2.0
+          pkg-config --modversion atk
+          pkg-config --modversion pango
+          pkg-config --modversion cairo
+
+      - name: Validate generated branch
+        env:
+          CRATES_JSON: ${{ steps.detect.outputs.crates_json }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f Cargo.toml ]; then
+            echo "Missing root Cargo.toml."
+            exit 1
+          fi
+
+          if [ ! -f crates/gpui_facade/Cargo.toml ]; then
+            echo "Missing crates/gpui_facade/Cargo.toml. Run fork-gpui first or use a zed_ref that already contains gpui_facade."
+            exit 1
+          fi
+
+          cargo metadata \
+            --no-deps \
+            --format-version=1 \
+            > "$RUNNER_TEMP/cargo-metadata.json"
+
+          mapfile -t CHECK_PACKAGES < <(python - "$RUNNER_TEMP/cargo-metadata.json" <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          metadata_path = Path(sys.argv[1])
+          crates = json.loads(os.environ["CRATES_JSON"])
+          metadata = json.loads(metadata_path.read_text())
+
+          packages_by_id = {pkg.get("id"): pkg for pkg in metadata.get("packages", []) if pkg.get("id")}
+          workspace_member_ids = metadata.get("workspace_members", [])
+          workspace_packages = [packages_by_id[package_id] for package_id in workspace_member_ids if package_id in packages_by_id]
+
+          if not workspace_member_ids:
+              raise SystemExit("cargo metadata succeeded, but workspace_members is empty")
+
+          workspace_names = {pkg.get("name") for pkg in workspace_packages if pkg.get("name")}
+          workspace_manifest_paths = {str(Path(pkg.get("manifest_path", ""))) for pkg in workspace_packages}
+
+          missing_metadata_ids = [package_id for package_id in workspace_member_ids if package_id not in packages_by_id]
+          if missing_metadata_ids:
+              print("Workspace member IDs missing from metadata packages:")
+              for package_id in missing_metadata_ids:
+                  print(f"  - {package_id}")
+              raise SystemExit("cargo metadata is internally inconsistent")
+
+          missing_imported = []
+          for package, item in sorted(crates.items()):
+              manifest = str((Path.cwd() / item["target"] / "Cargo.toml").resolve())
+              if package not in workspace_names and manifest not in workspace_manifest_paths:
+                  missing_imported.append(f"{package}: {item['target']}/Cargo.toml")
+
+          required = {"gpui_facade", "gpui", "gpui_platform"}
+          missing_required = sorted(name for name in required if name not in workspace_names)
+
+          missing_manifest_files = []
+          for pkg in workspace_packages:
+              manifest = pkg.get("manifest_path")
+              if not manifest or not Path(manifest).is_file():
+                  missing_manifest_files.append((pkg.get("name", "<unnamed>"), manifest or "<missing>"))
+
+          if missing_imported:
+              print("Imported packages not found as workspace members:")
+              for item in missing_imported:
+                  print(f"  - {item}")
+              raise SystemExit("Imported packages are missing from cargo metadata workspace members")
+
+          if missing_required:
+              print("Workspace package names found:")
+              for name in sorted(workspace_names):
+                  print(f"  - {name}")
+              raise SystemExit("Required GPUI packages are missing: " + ", ".join(missing_required))
+
+          if missing_manifest_files:
+              print("Workspace packages with missing Cargo.toml files:")
+              for name, manifest in missing_manifest_files:
+                  print(f"  - {name}: {manifest}")
+              raise SystemExit("One or more workspace package manifests are missing")
+
+          check_packages = sorted(set(crates.keys()) | {"gpui_facade"})
+          for package in check_packages:
+              if package not in workspace_names:
+                  raise SystemExit(f"Package selected for cargo check is not in workspace metadata: {package}")
+              print(package)
+          PY
+          )
+
+          CARGO_ARGS=()
+          for package in "${CHECK_PACKAGES[@]}"; do
+            CARGO_ARGS+=("-p" "$package")
+          done
+
+          echo "Checking imported package graph only:"
+          printf '  - %s\n' "${CHECK_PACKAGES[@]}"
+          cargo check "${CARGO_ARGS[@]}" --all-targets
+
+          {
+            echo "## Validation summary"
+            echo
+            echo "Validated generated branch with:"
+            echo "- cargo metadata --no-deps --format-version=1"
+            echo "- relative path resource scan/import validation for imported Rust files (node_modules ignored)"
+            echo "- cargo check for imported packages plus gpui_facade only"
+            echo
+            echo "Checked packages:"
+            printf -- "- %s\n" "${CHECK_PACKAGES[@]}"
+            echo
+            echo "Imported package paths:"
+            python - <<'PY'
+          import json
+          import os
+          crates = json.loads(os.environ["CRATES_JSON"])
+          for package, item in sorted(crates.items()):
+              print(f"- {package}: {item['target']}")
+          PY
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Commit generated branch
         id: generated_commit
+        env:
+          IMPORTED_PATHS_JSON: ${{ steps.detect.outputs.imported_paths_json }}
+          IMPORTED_RESOURCE_PATHS_JSON: ${{ steps.resource_validation.outputs.imported_resource_paths_json }}
         shell: bash
         run: |
           set -euo pipefail
 
-          git add Cargo.toml crates/gpui_component*
+          mapfile -t IMPORTED_PATHS < <(python - <<'PY'
+          import json
+          import os
+          for path in json.loads(os.environ["IMPORTED_PATHS_JSON"]):
+              print(path)
+          PY
+          )
+
+          mapfile -t IMPORTED_RESOURCE_PATHS < <(python - <<'PY'
+          import json
+          import os
+          raw = os.environ.get("IMPORTED_RESOURCE_PATHS_JSON") or "[]"
+          for path in json.loads(raw):
+              print(path)
+          PY
+          )
+
+          git add Cargo.toml
+          for path in "${IMPORTED_PATHS[@]}"; do
+            git add "$path"
+          done
+          for path in "${IMPORTED_RESOURCE_PATHS[@]}"; do
+            if [[ -e "$path" ]]; then
+              git add -f -- "$path"
+            else
+              echo "Imported resource path is missing before commit: $path" >&2
+              exit 1
+            fi
+          done
 
           if git diff --cached --quiet; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
@@ -626,16 +2534,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          TARGET_BRANCH="${{ inputs.target_branch }}"
+          TARGET_BRANCH="${TARGET_BRANCH}"
           REMOTE_GENERATED_BRANCH="__remote_generated_tree_for_compare"
 
           if git ls-remote --exit-code --heads origin "$TARGET_BRANCH" >/dev/null 2>&1; then
             git fetch --no-tags origin "$TARGET_BRANCH:refs/remotes/origin/$TARGET_BRANCH"
 
-            # Normalize the existing remote branch into a temporary local branch.
-            # If the remote branch ends with the nightly README-only commit,
-            # move the temporary branch back one commit so it points at the
-            # previous generated source tree.
             git branch -f "$REMOTE_GENERATED_BRANCH" "refs/remotes/origin/$TARGET_BRANCH"
 
             if git rev-parse "$REMOTE_GENERATED_BRANCH^" >/dev/null 2>&1; then
@@ -670,3 +2574,25 @@ jobs:
           fi
 
           git push --force-with-lease origin "HEAD:$TARGET_BRANCH"
+
+      - name: Failure summary
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## bind-gpui-component job failed"
+            echo ""
+            echo "- Zed ref: \`${{ inputs.zed_ref }}\`"
+            echo "- Source repo: \`${{ inputs.source_repo }}\`"
+            echo "- Source ref: \`${{ inputs.source_ref }}\`"
+            echo "- Source root package: \`${{ inputs.source_root_package }}\`"
+            echo "- Target branch: \`${{ inputs.target_branch }}\`"
+            echo ""
+            echo "Review the failed step log above. Common generated-manifest causes include:"
+            echo ""
+            echo "- A source dependency inherited from \`[workspace.dependencies]\` needs features that the target workspace does not provide."
+            echo "- A source dependency has the same name as a target workspace dependency but a different git/rev/package/default-features identity."
+            echo "- An imported package or local path dependency was renamed upstream and no longer matches the discovered package graph."
+            echo "- A relative path resource referenced by imported Rust code was over-excluded or missing; paths under \`node_modules\` are ignored by design."
+          } >> "$GITHUB_STEP_SUMMARY"

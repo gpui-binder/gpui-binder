@@ -62,6 +62,13 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       WORKFLOW_REF: ${{ github.ref_name }}
+      UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+      UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
+      SOURCE_REPO: ${{ inputs.source_repo }}
+      SOURCE_REF: ${{ inputs.source_ref }}
+      FORK_OUTPUT_BRANCH: ${{ inputs.fork_output_branch }}
+      BIND_TARGET_BRANCH: ${{ inputs.bind_target_branch }}
+      FORCE_PUSH: ${{ inputs.force_push }}
 
     steps:
       - name: Show pipeline inputs
@@ -71,13 +78,13 @@ jobs:
 
           echo "Workflow ref: ${WORKFLOW_REF}"
           echo "Repository: ${GH_REPO}"
-          echo "Upstream repo: ${{ inputs.upstream_repo }}"
-          echo "Upstream branch: ${{ inputs.upstream_branch }}"
-          echo "Fork output branch: ${{ inputs.fork_output_branch }}"
-          echo "gpui-component source repo: ${{ inputs.source_repo }}"
-          echo "gpui-component source ref: ${{ inputs.source_ref }}"
-          echo "Bind target branch: ${{ inputs.bind_target_branch }}"
-          echo "Force push: ${{ inputs.force_push }}"
+          echo "Upstream repo: ${UPSTREAM_REPO}"
+          echo "Upstream branch: ${UPSTREAM_BRANCH}"
+          echo "Fork output branch: ${FORK_OUTPUT_BRANCH}"
+          echo "gpui-component source repo: ${SOURCE_REPO}"
+          echo "gpui-component source ref: ${SOURCE_REF}"
+          echo "Bind target branch: ${BIND_TARGET_BRANCH}"
+          echo "Force push: ${FORCE_PUSH}"
 
       - name: Run workflows sequentially
         shell: bash
@@ -146,20 +153,20 @@ jobs:
           }
 
           dispatch_and_wait "fork-gpui.yaml" \
-            -f upstream_repo="${{ inputs.upstream_repo }}" \
-            -f upstream_branch="${{ inputs.upstream_branch }}" \
-            -f output_branch="${{ inputs.fork_output_branch }}" \
+            -f upstream_repo="${UPSTREAM_REPO}" \
+            -f upstream_branch="${UPSTREAM_BRANCH}" \
+            -f output_branch="${FORK_OUTPUT_BRANCH}" \
             -f commit_message="Add gpui facade crate" \
-            -f force_push="${{ inputs.force_push }}"
+            -f force_push="${FORCE_PUSH}"
 
           dispatch_and_wait "bind-gpui-component.yaml" \
-            -f zed_ref="${{ inputs.fork_output_branch }}" \
-            -f source_repo="${{ inputs.source_repo }}" \
-            -f source_ref="${{ inputs.source_ref }}" \
-            -f target_branch="${{ inputs.bind_target_branch }}"
+            -f zed_ref="${FORK_OUTPUT_BRANCH}" \
+            -f source_repo="${SOURCE_REPO}" \
+            -f source_ref="${SOURCE_REF}" \
+            -f target_branch="${BIND_TARGET_BRANCH}"
 
           dispatch_and_wait "check-cargo-local-dependencies.yaml" \
-            -f ref="${{ inputs.bind_target_branch }}"
+            -f ref="${BIND_TARGET_BRANCH}"
 
       - name: Summary
         if: always()
@@ -179,13 +186,13 @@ jobs:
             echo "Inputs:"
             echo ""
             echo "- Workflow ref: \`${WORKFLOW_REF}\`"
-            echo "- Upstream repo: \`${{ inputs.upstream_repo }}\`"
-            echo "- Upstream branch: \`${{ inputs.upstream_branch }}\`"
-            echo "- gpui-component source repo: \`${{ inputs.source_repo }}\`"
-            echo "- gpui-component source ref: \`${{ inputs.source_ref }}\`"
+            echo "- Upstream repo: \`${UPSTREAM_REPO}\`"
+            echo "- Upstream branch: \`${UPSTREAM_BRANCH}\`"
+            echo "- gpui-component source repo: \`${SOURCE_REPO}\`"
+            echo "- gpui-component source ref: \`${SOURCE_REF}\`"
             echo ""
             echo "Branches:"
             echo ""
-            echo "- Fork output branch: \`${{ inputs.fork_output_branch }}\`"
-            echo "- Final bind/check branch: \`${{ inputs.bind_target_branch }}\`"
+            echo "- Fork output branch: \`${FORK_OUTPUT_BRANCH}\`"
+            echo "- Final bind/check branch: \`${BIND_TARGET_BRANCH}\`"
           } >> "$GITHUB_STEP_SUMMARY"

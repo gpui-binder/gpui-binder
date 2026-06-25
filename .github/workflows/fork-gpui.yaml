@@ -33,6 +33,12 @@ on:
         default: false
         type: boolean
 
+      debug_logs:
+        description: "Print verbose debug logs"
+        required: false
+        default: false
+        type: boolean
+
 permissions:
   contents: write
 
@@ -56,7 +62,14 @@ env:
     .cloudflare/
     extensions/workflows/
     script/**
-    assets/**
+    assets/badge/**
+    assets/icons/**
+    assets/images/**
+    assets/keymaps/**
+    assets/prompts/**
+    assets/settings/**
+    assets/sounds/**
+    assets/themes/**
     extensions/glsl/
     extensions/html/
     extensions/proto/
@@ -331,7 +344,7 @@ env:
     workspace = true
 
     [lib]
-    path = "src/main.rs"
+    path = "src/lib.rs"
 
     [features]
     default = ["font-kit", "wayland", "x11", "windows-manifest"]
@@ -421,10 +434,14 @@ env:
     let _ = gpui::gpui_web::WebPlatform::new(true);
     ```
 
-  FILE__CRATES_GPUI_FACADE_SRC_MAIN_RS: |
+  FILE__CRATES_GPUI_FACADE_SRC_LIB_RS: |
     #![doc = "Facade crate that re-exports GPUI plus optional GPUI-related crates."]
 
     pub use gpui::*;
+
+    // No extra test re-export is needed here. When the facade feature
+    // `test-support` is enabled, it enables `gpui/test-support`, and upstream
+    // `gpui` itself publicly re-exports `test::*` from `gpui::*`.
 
     pub mod gpui_platform {
         pub use ::gpui_platform::*;
@@ -479,37 +496,108 @@ jobs:
     name: Generate modified branch
     runs-on: ubuntu-latest
 
+    env:
+      UPSTREAM_REPO_INPUT: ${{ inputs.upstream_repo }}
+      UPSTREAM_BRANCH_INPUT: ${{ inputs.upstream_branch }}
+      OUTPUT_BRANCH_INPUT: ${{ inputs.output_branch }}
+      COMMIT_MESSAGE_INPUT: ${{ inputs.commit_message }}
+      FORCE_PUSH_INPUT: ${{ inputs.force_push }}
+      DEBUG_LOGS_INPUT: ${{ inputs.debug_logs }}
+      CARGO_TARGET_DIR: /tmp/cargo-target
+      RUN_NUMBER_VALUE: ${{ github.run_number }}
+      TARGET_REPOSITORY: ${{ github.repository }}
+      PUSH_TOKEN: ${{ github.token }}
+
     steps:
-      - name: Sparse clone upstream, validate, and create generated branch
+      - name: Install Linux cargo dependencies
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libpango1.0-dev \
+            libcairo2-dev \
+            pkg-config \
+            libfontconfig1-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libssl-dev
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            /tmp/cargo-target
+          key: cargo-${{ runner.os }}-${{ inputs.upstream_repo }}-${{ inputs.upstream_branch }}-fork-gpui-perf-v1
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ inputs.upstream_repo }}-${{ inputs.upstream_branch }}-
+            cargo-${{ runner.os }}-${{ inputs.upstream_repo }}-
+            cargo-${{ runner.os }}-
+
+      - name: Sparse clone upstream, validate, and create generated branch
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          CURRENT_STAGE="initializing"
+
+          append_failure_summary() {
+            local status="${1:-unknown}"
+            local line="${2:-unknown}"
+
+            if [ -z "${GITHUB_STEP_SUMMARY:-}" ]; then
+              return 0
+            fi
+
+            {
+              echo "## fork-gpui failed"
+              echo ""
+              echo "- Stage: \`${CURRENT_STAGE:-unknown}\`"
+              echo "- Exit status: \`${status}\`"
+              echo "- Bash line: \`${line}\`"
+              echo "- Upstream repo: \`${UPSTREAM_REPO_INPUT:-unknown}\`"
+              echo "- Upstream branch/ref: \`${UPSTREAM_BRANCH_INPUT:-unknown}\`"
+              echo ""
+              echo "Check the failed step log above for command output. If the failure came from gpui_facade feature validation, the detailed feature report should appear above this section."
+              echo ""
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          trap 'status=$?; line=$LINENO; if [ "$status" -ne 0 ]; then append_failure_summary "$status" "$line"; fi' ERR
 
           git config --global init.defaultBranch main
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          UPSTREAM_REPO="${{ inputs.upstream_repo }}"
-          UPSTREAM_BRANCH="${{ inputs.upstream_branch }}"
+          UPSTREAM_REPO="${UPSTREAM_REPO_INPUT}"
+          UPSTREAM_BRANCH="${UPSTREAM_BRANCH_INPUT}"
 
-          OUTPUT_BRANCH="${{ inputs.output_branch }}"
+          OUTPUT_BRANCH="${OUTPUT_BRANCH_INPUT}"
           if [ -z "$OUTPUT_BRANCH" ]; then
             SAFE_REPO="$(printf '%s' "$UPSTREAM_REPO" | tr '/:@ ' '----')"
             SAFE_BRANCH="$(printf '%s' "$UPSTREAM_BRANCH" | tr '/:@ ' '----')"
-            OUTPUT_BRANCH="generated-${SAFE_REPO}-${SAFE_BRANCH}-${{ github.run_number }}"
+            OUTPUT_BRANCH="generated-${SAFE_REPO}-${SAFE_BRANCH}-${RUN_NUMBER_VALUE}"
           fi
 
           echo "Upstream repo: ${UPSTREAM_REPO}"
           echo "Upstream branch: ${UPSTREAM_BRANCH}"
           echo "Output branch: ${OUTPUT_BRANCH}"
 
-          SOURCE_DIR="$RUNNER_TEMP/source"
           OUT_DIR="$RUNNER_TEMP/out"
+          SOURCE_DIR="$OUT_DIR"
 
-          rm -rf "$SOURCE_DIR" "$OUT_DIR"
-          mkdir -p "$SOURCE_DIR" "$OUT_DIR"
+          rm -rf "$OUT_DIR"
+          mkdir -p "$OUT_DIR"
 
-          cd "$SOURCE_DIR"
+          cd "$OUT_DIR"
 
           git init
           git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
@@ -539,23 +627,28 @@ jobs:
             fi
           done
 
-          # Force-include files needed by the generator and metadata check.
+          # Force-include only files needed by the generator and metadata check.
+          # Do not force-include /crates/** here; that defeats crate exclusions and
+          # causes Git to materialize files that are deleted again later.
           {
             echo "/Cargo.toml"
             echo "/Cargo.lock"
             echo "/rust-toolchain.toml"
             echo "/rustfmt.toml"
-            echo "/crates/"
-            echo "/crates/**"
             echo "/crates/gpui/"
             echo "/crates/gpui/**"
             echo "/crates/gpui/Cargo.toml"
-            echo "/crates/gpui_facade/"
-            echo "/crates/gpui_facade/**"
+            # gpui_wgpu benches include font files via include_bytes! when
+            # cargo check --workspace --all-targets compiles bench targets.
+            # Keep this narrow: re-include only fonts, not all assets/**.
+            echo "/assets/fonts/"
+            echo "/assets/fonts/**"
           } >> "$SPARSE_FILE"
 
-          echo "Sparse checkout rules:"
-          cat "$SPARSE_FILE"
+          if [ "${DEBUG_LOGS_INPUT}" = "true" ]; then
+            echo "Sparse checkout rules:"
+            cat "$SPARSE_FILE"
+          fi
 
           git fetch \
             --filter=blob:none \
@@ -564,8 +657,10 @@ jobs:
 
           git checkout --detach FETCH_HEAD
 
-          echo "Sparse source checkout root:"
-          find . -maxdepth 2 -mindepth 1 -not -path './.git*' | sort | head -200
+          if [ "${DEBUG_LOGS_INPUT}" = "true" ]; then
+            echo "Sparse source checkout root:"
+            find . -maxdepth 2 -mindepth 1 -not -path './.git*' | sort | head -200
+          fi
 
           capture_gpui_package_metadata() {
             local metadata_file="$RUNNER_TEMP/gpui-package-metadata.toml"
@@ -611,35 +706,111 @@ jobs:
           }
 
           copy_sparse_source_to_output() {
-            echo "Copying sparse source checkout into output directory"
+            echo "Using sparse checkout directly as output directory"
+          }
 
-            cd "$SOURCE_DIR"
+          capture_upstream_file_dates_from_git() {
+            local snapshot_path="$RUNNER_TEMP/upstream-file-dates.tsv"
 
-            local rsync_excludes="$RUNNER_TEMP/rsync-excludes"
-            : > "$rsync_excludes"
+            echo "Capturing upstream file dates from Git commit history" >&2
 
-            printf '%s\n' "${EXCLUDE_PATTERNS}" | while IFS= read -r pattern; do
-              pattern="${pattern%$'\r'}"
+            cd "$OUT_DIR"
 
-              case "$pattern" in
-                "" ) continue ;;
-                \#* ) continue ;;
-                \!* ) continue ;;
-              esac
+            python3 - "$OUT_DIR" "$snapshot_path" <<'PY'
+          from datetime import datetime
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+          import subprocess
+          import sys
 
-              printf '%s\n' "$pattern" >> "$rsync_excludes"
-            done
+          root = Path(sys.argv[1]).resolve()
+          snapshot = Path(sys.argv[2]).resolve()
+          denver = ZoneInfo("America/Denver")
+          batch_size = 128
 
-            printf '%s\n' ".git/" >> "$rsync_excludes"
+          def denver_date(iso: str) -> str:
+              # Git %cI is strict ISO-8601, usually with an explicit numeric offset.
+              return datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(denver).date().isoformat()
 
-            rsync -a \
-              --delete \
-              --exclude-from="$rsync_excludes" \
-              "$SOURCE_DIR"/ \
-              "$OUT_DIR"/
+          raw = subprocess.run(
+              ["git", "-C", str(root), "ls-files", "-z"],
+              check=True,
+              stdout=subprocess.PIPE,
+          ).stdout
 
-            echo "Output tree after source copy:"
-            find "$OUT_DIR" -maxdepth 2 -mindepth 1 | sed "s#^$OUT_DIR/##" | sort | head -200
+          files = [item for item in raw.decode("utf-8", "surrogateescape").split("\0") if item]
+          files = [rel for rel in files if (root / rel).is_file()]
+
+          dates = {}
+
+          for offset in range(0, len(files), batch_size):
+              batch = files[offset:offset + batch_size]
+              wanted = set(batch)
+              current_date = None
+
+              proc = subprocess.Popen(
+                  [
+                      "git",
+                      "-C",
+                      str(root),
+                      "log",
+                      "--format=@@%cI",
+                      "--name-only",
+                      "--",
+                      *batch,
+                  ],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  text=True,
+                  encoding="utf-8",
+                  errors="surrogateescape",
+              )
+
+              assert proc.stdout is not None
+              for line in proc.stdout:
+                  line = line.rstrip("\n")
+
+                  if line.startswith("@@"):
+                      current_date = denver_date(line[2:])
+                      continue
+
+                  rel = line.strip()
+                  if not rel or current_date is None:
+                      continue
+
+                  if rel in wanted and rel not in dates:
+                      dates[rel] = current_date
+                      wanted.remove(rel)
+
+                      # Stop this batch as soon as every file has a latest commit date.
+                      # This avoids walking old history unnecessarily.
+                      if not wanted:
+                          proc.terminate()
+                          break
+
+              try:
+                  proc.wait(timeout=10)
+              except subprocess.TimeoutExpired:
+                  proc.kill()
+                  proc.wait()
+
+              if proc.returncode not in (0, -15, 143):
+                  stderr = proc.stderr.read() if proc.stderr is not None else ""
+                  raise SystemExit(f"git log failed while collecting file dates:\n{stderr}")
+
+          # Fallback should be rare, but keeps generated output robust if a sparse-checkout
+          # edge case leaves a file present but not tracked by Git.
+          for rel in files:
+              if rel not in dates:
+                  dates[rel] = datetime.fromtimestamp((root / rel).stat().st_mtime, denver).date().isoformat()
+
+          snapshot.write_text(
+              "".join(f"{rel}\t{dates[rel]}\n" for rel in sorted(dates)),
+              encoding="utf-8",
+          )
+          PY
+
+            echo "$snapshot_path"
           }
 
           remove_materialized_exclusions() {
@@ -678,12 +849,15 @@ jobs:
 
             python3 - "$metadata_file" "$path" <<'PY'
           from pathlib import Path
+          import json
           import os
           import re
           import sys
+          import tomllib
 
           metadata_file = Path(sys.argv[1])
           dst = Path(sys.argv[2])
+          gpui_manifest = Path("crates/gpui/Cargo.toml")
 
           template = os.environ["FILE__CRATES_GPUI_FACADE_CARGO_TOML"]
           metadata = metadata_file.read_text().rstrip()
@@ -696,7 +870,187 @@ jobs:
                   "Unresolved placeholders: " + ", ".join(sorted(set(missing)))
               )
 
-          dst.write_text(output.rstrip() + "\n")
+          if not gpui_manifest.exists():
+              raise SystemExit("Missing crates/gpui/Cargo.toml while generating gpui_facade")
+
+          def read_toml(path: Path):
+              return tomllib.loads(path.read_text(encoding="utf-8"))
+
+          def section_body(text: str, section: str) -> tuple[int, int, str]:
+              match = re.search(rf"(?ms)^\[{re.escape(section)}\]\s*(.*?)(?=^\[|\Z)", text)
+              if not match:
+                  raise SystemExit(f"Could not find [{section}] section")
+              return match.start(1), match.end(1), match.group(1)
+
+          def feature_key_order(text: str, section: str = "features") -> list[str]:
+              try:
+                  _, _, body = section_body(text, section)
+              except SystemExit:
+                  return []
+
+              order = []
+              seen = set()
+              for line in body.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("#") or "=" not in stripped:
+                      continue
+
+                  key = stripped.split("=", 1)[0].strip()
+                  if key.startswith('"') and key.endswith('"'):
+                      try:
+                          key = json.loads(key)
+                      except Exception:
+                          key = key.strip('"')
+
+                  if key and key not in seen:
+                      order.append(key)
+                      seen.add(key)
+              return order
+
+          def iter_dependency_tables(data):
+              for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+                  table = data.get(section, {})
+                  if isinstance(table, dict):
+                      yield table
+
+              target = data.get("target", {})
+              if isinstance(target, dict):
+                  for target_table in target.values():
+                      if not isinstance(target_table, dict):
+                          continue
+                      for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+                          table = target_table.get(section, {})
+                          if isinstance(table, dict):
+                              yield table
+
+          def explicit_dep_colon_refs(features: dict) -> set[str]:
+              refs = set()
+              for values in features.values():
+                  if not isinstance(values, list):
+                      continue
+                  for value in values:
+                      if isinstance(value, str) and value.startswith("dep:"):
+                          refs.add(value[4:])
+              return refs
+
+          def package_feature_map(path: Path) -> tuple[dict[str, list[str]], list[str]]:
+              text = path.read_text(encoding="utf-8")
+              data = tomllib.loads(text)
+              explicit = data.get("features", {})
+              if not isinstance(explicit, dict):
+                  explicit = {}
+
+              features = {name: list(values) for name, values in explicit.items() if isinstance(values, list)}
+              order = feature_key_order(text)
+              seen = set(order)
+
+              hidden_optional_deps = explicit_dep_colon_refs(features)
+              for table in iter_dependency_tables(data):
+                  for dep_name, dep_value in table.items():
+                      if not isinstance(dep_value, dict) or dep_value.get("optional") is not True:
+                          continue
+                      if dep_name in hidden_optional_deps:
+                          continue
+                      if dep_name not in features:
+                          features[dep_name] = []
+                      if dep_name not in seen:
+                          order.append(dep_name)
+                          seen.add(dep_name)
+
+              return features, order
+
+          def unique(values: list[str]) -> list[str]:
+              seen = set()
+              result = []
+              for value in values:
+                  if value in seen:
+                      continue
+                  seen.add(value)
+                  result.append(value)
+              return result
+
+          def toml_key(key: str) -> str:
+              if re.fullmatch(r"[A-Za-z0-9_-]+", key):
+                  return key
+              return json.dumps(key)
+
+          def format_feature_value(values: list[str]) -> str:
+              values = unique(values)
+              if not values:
+                  return "[]"
+              if len(values) == 1:
+                  return "[" + json.dumps(values[0]) + "]"
+              lines = ["["]
+              for value in values:
+                  lines.append(f"    {json.dumps(value)},")
+              lines.append("]")
+              return "\n".join(lines)
+
+          def replace_features_section(text: str, features: dict[str, list[str]], order: list[str]) -> str:
+              body_start, body_end, _ = section_body(text, "features")
+
+              seen = set()
+              final_order = []
+              for key in order:
+                  if key in features and key not in seen:
+                      final_order.append(key)
+                      seen.add(key)
+              for key in features:
+                  if key not in seen:
+                      final_order.append(key)
+                      seen.add(key)
+
+              body = ""
+              for key in final_order:
+                  body += f"{toml_key(key)} = {format_feature_value(features[key])}\n"
+
+              return text[:body_start] + body + text[body_end:]
+
+          gpui_features, gpui_feature_order = package_feature_map(gpui_manifest)
+
+          facade_data = tomllib.loads(output)
+          facade_features = facade_data.get("features", {})
+          if not isinstance(facade_features, dict):
+              raise SystemExit("Generated gpui_facade Cargo.toml has no [features] table")
+          facade_features = {
+              name: list(values)
+              for name, values in facade_features.items()
+              if isinstance(values, list)
+          }
+          facade_order = feature_key_order(output)
+
+          added_features = []
+          amended_features = []
+
+          for name in gpui_feature_order:
+              if name not in gpui_features:
+                  continue
+
+              mirror_ref = f"gpui/{name}"
+
+              if name not in facade_features:
+                  facade_features[name] = [mirror_ref]
+                  facade_order.append(name)
+                  added_features.append(name)
+                  continue
+
+              if mirror_ref not in facade_features[name]:
+                  facade_features[name] = [mirror_ref] + facade_features[name]
+                  amended_features.append(name)
+
+          output = replace_features_section(output, facade_features, facade_order)
+
+          dst.write_text(output.rstrip() + "\n", encoding="utf-8")
+
+          print("gpui_facade feature mirror generation completed")
+          if added_features:
+              print("Added missing gpui passthrough features:")
+              for name in added_features:
+                  print(f"  - {name}")
+          if amended_features:
+              print("Amended existing gpui_facade features to forward to gpui:")
+              for name in amended_features:
+                  print(f"  - {name}")
           PY
           }
 
@@ -724,24 +1078,35 @@ jobs:
           }
 
           generate_files_by_date_markdown() {
+            local date_snapshot_path="$1"
             local output_path="$OUT_DIR/FILES-BY-DATE-ZED.md"
 
             echo "Generating: FILES-BY-DATE-ZED.md"
 
             cd "$OUT_DIR"
 
-            python3 - "$SOURCE_DIR" "$OUT_DIR" "$output_path" <<'PY'
+            python3 - "$OUT_DIR" "$output_path" "$date_snapshot_path" <<'PY'
           from collections import defaultdict
           from datetime import datetime
           from pathlib import Path
           from zoneinfo import ZoneInfo
-          import subprocess
           import sys
 
-          source_root = Path(sys.argv[1]).resolve()
-          output_root = Path(sys.argv[2]).resolve()
-          output_path = Path(sys.argv[3]).resolve()
+          output_root = Path(sys.argv[1]).resolve()
+          output_path = Path(sys.argv[2]).resolve()
+          date_snapshot_path = Path(sys.argv[3]).resolve()
           denver = ZoneInfo("America/Denver")
+
+          source_dates = {}
+          if date_snapshot_path.exists():
+              for line in date_snapshot_path.read_text(encoding="utf-8").splitlines():
+                  if not line.strip():
+                      continue
+                  try:
+                      rel, date = line.split("	", 1)
+                  except ValueError:
+                      continue
+                  source_dates[rel] = date
 
           # Hard-coded exclusions for FILES-BY-DATE-ZED.md.
           # These files are generated, rewritten, renamed, or intentionally omitted
@@ -753,47 +1118,18 @@ jobs:
               "README-zed.md",
               "crates/gpui_facade/Cargo.toml",
               "crates/gpui_facade/README.md",
-              "crates/gpui_facade/src/main.rs",
+              "crates/gpui_facade/src/lib.rs",
           }
 
-          generated_or_rewritten = {
-              "Cargo.toml",
-              "Cargo.lock",
-              "crates/gpui_facade/Cargo.toml",
-              "crates/gpui_facade/README.md",
-              "crates/gpui_facade/src/main.rs",
-          }
+          def source_date(path: Path, rel: str) -> str:
+              # Prefer the upstream Git commit date captured before workflow rewrites.
+              # Filesystem mtimes from git checkout are normally checkout-time, so they
+              # cannot be used as historical source-file dates.
+              snapshot_date = source_dates.get(rel)
+              if snapshot_date:
+                  return snapshot_date
 
-          def output_to_source_path(rel: str) -> str | None:
-              if rel == "README-zed.md":
-                  return "README.md"
-              if rel in generated_or_rewritten:
-                  return None
-              return rel
-
-          def source_last_change_date(source_rel: str) -> str | None:
-              result = subprocess.run(
-                  [
-                      "git",
-                      "-C",
-                      str(source_root),
-                      "log",
-                      "-1",
-                      "--format=%cI",
-                      "--",
-                      source_rel,
-                  ],
-                  text=True,
-                  stdout=subprocess.PIPE,
-                  stderr=subprocess.PIPE,
-                  check=False,
-              )
-              stamp = result.stdout.strip()
-              if not stamp:
-                  return None
-              return datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone(denver).date().isoformat()
-
-          def filesystem_date(path: Path) -> str:
+              # Fallback for generated or untracked files that are not excluded above.
               return datetime.fromtimestamp(path.stat().st_mtime, denver).date().isoformat()
 
           groups = defaultdict(list)
@@ -811,13 +1147,7 @@ jobs:
               if rel in manifest_excludes:
                   continue
 
-              source_rel = output_to_source_path(rel)
-              date = source_last_change_date(source_rel) if source_rel is not None else None
-
-              if date is None:
-                  date = filesystem_date(path)
-
-              groups[date].append(rel)
+              groups[source_date(path, rel)].append(rel)
 
           lines = [
               "# Files by date changed in Zed",
@@ -826,8 +1156,8 @@ jobs:
               "",
               "Dates are grouped using the Denver, Colorado timezone (America/Denver).",
               "",
-              "For files copied from Zed, dates come from the latest Git commit date that changed each file. Commit hashes and commit messages are intentionally omitted.",
-              "Generated or rewritten files that do not map directly to a Zed source file are grouped by their filesystem modified date from this workflow run.",
+              "Dates come from the latest upstream Git commit that changed each tracked file, grouped in the Denver timezone.",
+              "Generated or rewritten files excluded from this manifest are intentionally omitted.",
               "",
           ]
 
@@ -1072,6 +1402,14 @@ jobs:
 
               new_default_members.append(item)
 
+          if not new_default_members and generated_member in member_set:
+              # The generated branch has a virtual workspace. Cargo uses
+              # default-members for root package commands when present; keeping
+              # an explicit empty array makes root `cargo check` unexpectedly
+              # select nothing. Fall back to the facade package instead of
+              # hard-coding upstream Zed members that may change.
+              new_default_members.append(generated_member)
+
           new_exclude = unique_preserve_order(
               existing_exclude + sorted(remove_from_workspace)
           )
@@ -1095,8 +1433,337 @@ jobs:
           PY
           }
 
+          validate_gpui_facade_features() {
+            echo "Validating gpui_facade feature mirror and feature references"
+
+            cd "$OUT_DIR"
+
+            python3 - "${GITHUB_STEP_SUMMARY:-}" <<'PY'
+          from pathlib import Path
+          import json
+          import re
+          import sys
+          import tomllib
+
+          summary_arg = sys.argv[1] if len(sys.argv) > 1 else ""
+          summary_path = Path(summary_arg) if summary_arg else None
+          root = Path.cwd().resolve()
+          root_manifest = root / "Cargo.toml"
+          gpui_manifest = root / "crates/gpui/Cargo.toml"
+          facade_manifest = root / "crates/gpui_facade/Cargo.toml"
+
+          errors = []
+          warnings = []
+          details = []
+
+          def add_error(message: str):
+              errors.append(message)
+              print(f"ERROR: {message}")
+
+          def add_warning(message: str):
+              warnings.append(message)
+              print(f"WARNING: {message}")
+
+          def read_toml(path: Path):
+              if not path.exists():
+                  add_error(f"Missing required manifest: {path.relative_to(root) if path.is_relative_to(root) else path}")
+                  return {}
+              try:
+                  return tomllib.loads(path.read_text(encoding="utf-8"))
+              except Exception as exc:
+                  add_error(f"Could not parse {path}: {exc}")
+                  return {}
+
+          def section_body(text: str, section: str) -> str:
+              match = re.search(rf"(?ms)^\[{re.escape(section)}\]\s*(.*?)(?=^\[|\Z)", text)
+              return match.group(1) if match else ""
+
+          def feature_key_order(path: Path) -> list[str]:
+              if not path.exists():
+                  return []
+              body = section_body(path.read_text(encoding="utf-8"), "features")
+              order = []
+              seen = set()
+              for line in body.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("#") or "=" not in stripped:
+                      continue
+                  key = stripped.split("=", 1)[0].strip()
+                  if key.startswith('"') and key.endswith('"'):
+                      try:
+                          key = json.loads(key)
+                      except Exception:
+                          key = key.strip('"')
+                  if key and key not in seen:
+                      order.append(key)
+                      seen.add(key)
+              return order
+
+          def iter_dependency_tables(data):
+              for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+                  table = data.get(section, {})
+                  if isinstance(table, dict):
+                      yield section, table
+
+              target = data.get("target", {})
+              if isinstance(target, dict):
+                  for target_name, target_table in target.items():
+                      if not isinstance(target_table, dict):
+                          continue
+                      for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+                          table = target_table.get(section, {})
+                          if isinstance(table, dict):
+                              yield f"target.{target_name}.{section}", table
+
+          def dep_colon_refs(features: dict[str, list[str]]) -> set[str]:
+              refs = set()
+              for values in features.values():
+                  if not isinstance(values, list):
+                      continue
+                  for value in values:
+                      if isinstance(value, str) and value.startswith("dep:"):
+                          refs.add(value[4:])
+              return refs
+
+          def package_features(path: Path) -> tuple[dict[str, list[str]], list[str]]:
+              data = read_toml(path)
+              explicit = data.get("features", {})
+              if not isinstance(explicit, dict):
+                  explicit = {}
+
+              features = {name: list(values) for name, values in explicit.items() if isinstance(values, list)}
+              order = feature_key_order(path)
+              seen = set(order)
+              hidden_optional_deps = dep_colon_refs(features)
+
+              for _, table in iter_dependency_tables(data):
+                  for dep_name, dep_value in table.items():
+                      if isinstance(dep_value, dict) and dep_value.get("optional") is True:
+                          if dep_name in hidden_optional_deps:
+                              continue
+                          if dep_name not in features:
+                              features[dep_name] = []
+                          if dep_name not in seen:
+                              order.append(dep_name)
+                              seen.add(dep_name)
+
+              return features, order
+
+          root_data = read_toml(root_manifest)
+          gpui_features, gpui_order = package_features(gpui_manifest)
+          facade_data = read_toml(facade_manifest)
+          facade_features, facade_order = package_features(facade_manifest)
+
+          workspace_deps = root_data.get("workspace", {}).get("dependencies", {})
+          if not isinstance(workspace_deps, dict):
+              workspace_deps = {}
+
+          facade_dependency_entries = {}
+          for section_name, table in iter_dependency_tables(facade_data):
+              for dep_name, dep_value in table.items():
+                  entry = facade_dependency_entries.setdefault(
+                      dep_name,
+                      {"values": [], "sections": [], "optional": False},
+                  )
+                  entry["values"].append(dep_value)
+                  entry["sections"].append(section_name)
+                  if isinstance(dep_value, dict) and dep_value.get("optional") is True:
+                      entry["optional"] = True
+
+          def dep_manifest(dep_name: str) -> Path | None:
+              entry = facade_dependency_entries.get(dep_name)
+              if not entry:
+                  return None
+
+              for dep_value in entry["values"]:
+                  value = dep_value
+                  base = facade_manifest.parent
+
+                  if isinstance(value, dict) and value.get("workspace") is True:
+                      workspace_value = workspace_deps.get(dep_name)
+                      if not isinstance(workspace_value, dict):
+                          continue
+                      value = workspace_value
+                      base = root
+
+                  if isinstance(value, dict) and isinstance(value.get("path"), str):
+                      candidate = (base / value["path"] / "Cargo.toml").resolve()
+                      if candidate.exists():
+                          return candidate
+
+              return None
+
+          dependency_feature_cache = {}
+          def dependency_feature_set(dep_name: str) -> set[str] | None:
+              if dep_name in dependency_feature_cache:
+                  return dependency_feature_cache[dep_name]
+
+              manifest = dep_manifest(dep_name)
+              if manifest is None:
+                  dependency_feature_cache[dep_name] = None
+                  return None
+
+              features, _ = package_features(manifest)
+              feature_set = set(features)
+              dependency_feature_cache[dep_name] = feature_set
+              return feature_set
+
+          # 1. gpui_facade must accept every feature that the underlying gpui
+          # package accepts, including implicit features created by non-hidden
+          # optional dependencies. This prevents downstream users from failing
+          # when they replace package = "gpui" with package = "gpui_facade".
+          missing_mirrors = []
+          incomplete_mirrors = []
+
+          for feature_name in gpui_order:
+              if feature_name not in gpui_features:
+                  continue
+
+              mirror_ref = f"gpui/{feature_name}"
+              if feature_name not in facade_features:
+                  missing_mirrors.append(feature_name)
+              elif mirror_ref not in facade_features[feature_name]:
+                  incomplete_mirrors.append((feature_name, mirror_ref))
+
+          if missing_mirrors:
+              add_error(
+                  "gpui_facade is missing feature mirror definitions for: "
+                  + ", ".join(sorted(missing_mirrors))
+              )
+
+          if incomplete_mirrors:
+              add_error(
+                  "gpui_facade has feature names that exist in gpui but do not forward to gpui/<feature>: "
+                  + ", ".join(f"{name} should include {ref}" for name, ref in sorted(incomplete_mirrors))
+              )
+
+          # 2. Every feature reference written in gpui_facade must be resolvable.
+          # This catches target-only paths that a plain cargo check on Linux may
+          # not exercise, such as macOS-only or Windows-only package features.
+          bad_refs = []
+
+          def is_known_local_feature(name: str) -> bool:
+              return name in facade_features
+
+          for feature_name in facade_order:
+              values = facade_features.get(feature_name, [])
+              if not isinstance(values, list):
+                  bad_refs.append((feature_name, "<non-list>", "feature value is not an array"))
+                  continue
+
+              for value in values:
+                  if not isinstance(value, str):
+                      bad_refs.append((feature_name, repr(value), "feature item is not a string"))
+                      continue
+
+                  if value.startswith("dep:"):
+                      dep_name = value[4:]
+                      dep_entry = facade_dependency_entries.get(dep_name)
+                      if dep_entry is None:
+                          bad_refs.append((feature_name, value, "dep: reference points to a dependency that is not declared"))
+                      elif dep_entry.get("optional") is not True:
+                          bad_refs.append((feature_name, value, "dep: reference points to a non-optional dependency"))
+                      continue
+
+                  if "/" in value:
+                      dep_part, dep_feature = value.split("/", 1)
+                      weak = dep_part.endswith("?")
+                      dep_name = dep_part[:-1] if weak else dep_part
+                      dep_entry = facade_dependency_entries.get(dep_name)
+
+                      if dep_entry is None:
+                          bad_refs.append((feature_name, value, "dependency feature reference points to an undeclared dependency"))
+                          continue
+
+                      if weak and dep_entry.get("optional") is not True:
+                          bad_refs.append((feature_name, value, "weak dependency feature reference uses ? on a non-optional dependency"))
+
+                      known_dep_features = dependency_feature_set(dep_name)
+                      if known_dep_features is not None and dep_feature != "default" and dep_feature not in known_dep_features:
+                          manifest = dep_manifest(dep_name)
+                          manifest_rel = manifest.relative_to(root) if manifest and manifest.is_relative_to(root) else manifest
+                          bad_refs.append(
+                              (
+                                  feature_name,
+                                  value,
+                                  f"dependency feature is not defined in {manifest_rel}",
+                              )
+                          )
+                      continue
+
+                  if not is_known_local_feature(value):
+                      bad_refs.append((feature_name, value, "local feature reference is not defined in gpui_facade"))
+
+          if bad_refs:
+              for feature_name, value, reason in bad_refs:
+                  add_error(f"Invalid gpui_facade feature reference in {feature_name}: {value} ({reason})")
+
+          details.append(f"Mirrored gpui features checked: {len(gpui_order)}")
+          details.append(f"gpui_facade features checked: {len(facade_order)}")
+          details.append(f"Declared gpui_facade dependency keys checked: {len(facade_dependency_entries)}")
+
+          def md_escape(text: str) -> str:
+              return text.replace("|", "\\|")
+
+          def write_summary():
+              if summary_path is None:
+                  return
+
+              lines = []
+              lines.append("## gpui_facade feature validation")
+              lines.append("")
+              lines.append(f"- Result: {'failed' if errors else 'passed'}")
+              for detail in details:
+                  lines.append(f"- {detail}")
+              lines.append("")
+
+              if missing_mirrors:
+                  lines.append("### Missing mirrored features")
+                  lines.append("")
+                  for name in sorted(missing_mirrors):
+                      lines.append(f"- `{name}` should be added as `{name} = [\"gpui/{name}\"]`")
+                  lines.append("")
+
+              if incomplete_mirrors:
+                  lines.append("### Incomplete mirrored features")
+                  lines.append("")
+                  for name, ref in sorted(incomplete_mirrors):
+                      lines.append(f"- `{name}` should include `{ref}`")
+                  lines.append("")
+
+              if bad_refs:
+                  lines.append("### Invalid feature references")
+                  lines.append("")
+                  lines.append("| facade feature | reference | problem |")
+                  lines.append("| --- | --- | --- |")
+                  for feature_name, value, reason in bad_refs:
+                      lines.append(f"| `{md_escape(feature_name)}` | `{md_escape(str(value))}` | {md_escape(str(reason))} |")
+                  lines.append("")
+
+              if warnings:
+                  lines.append("### Warnings")
+                  lines.append("")
+                  for warning in warnings:
+                      lines.append(f"- {warning}")
+                  lines.append("")
+
+              summary_path.parent.mkdir(parents=True, exist_ok=True)
+              with summary_path.open("a", encoding="utf-8") as f:
+                  f.write("\n".join(lines).rstrip() + "\n\n")
+
+          write_summary()
+
+          if errors:
+              raise SystemExit("gpui_facade feature validation failed; see GitHub workflow summary for details")
+
+          print("gpui_facade feature validation passed")
+          for detail in details:
+              print(f"  - {detail}")
+          PY
+          }
+
           validate_cargo_metadata() {
-            echo "Validating with cargo metadata before creating output branch"
+            echo "Validating every workspace package before creating output branch"
 
             cd "$OUT_DIR"
 
@@ -1115,42 +1782,119 @@ jobs:
               --format-version=1 \
               > "$RUNNER_TEMP/cargo-metadata.json"
 
-            python3 - "$RUNNER_TEMP/cargo-metadata.json" <<'PY'
+            python3 - "$RUNNER_TEMP/cargo-metadata.json" "$RUNNER_TEMP/workspace-package-manifests.tsv" <<'PY'
           import json
           import sys
+          from pathlib import Path
 
-          metadata_path = sys.argv[1]
+          metadata_path = Path(sys.argv[1])
+          manifest_list_path = Path(sys.argv[2])
 
-          with open(metadata_path, "r", encoding="utf-8") as f:
+          with metadata_path.open("r", encoding="utf-8") as f:
               metadata = json.load(f)
 
           packages = metadata.get("packages", [])
-          names = {pkg.get("name") for pkg in packages}
+          packages_by_id = {
+              pkg.get("id"): pkg
+              for pkg in packages
+              if pkg.get("id")
+          }
+          workspace_member_ids = metadata.get("workspace_members", [])
 
-          if "gpui_facade" not in names:
-              print("Workspace packages found:")
-              for name in sorted(n for n in names if n):
-                  print(f"  - {name}")
-              raise SystemExit("cargo metadata succeeded, but gpui_facade is not present in workspace metadata")
+          if not workspace_member_ids:
+              raise SystemExit("cargo metadata succeeded, but workspace_members is empty")
 
-          for pkg in packages:
-              if pkg.get("name") == "gpui_facade":
-                  manifest_path = pkg.get("manifest_path", "")
-                  print(f"Found gpui_facade manifest: {manifest_path}")
-                  break
-          PY
+          missing_ids = [
+              package_id
+              for package_id in workspace_member_ids
+              if package_id not in packages_by_id
+          ]
+          if missing_ids:
+              print("Workspace member IDs missing from metadata packages:")
+              for package_id in missing_ids:
+                  print(f"  - {package_id}")
+              raise SystemExit("cargo metadata is internally inconsistent")
 
-            echo "cargo metadata validation passed"
+          workspace_packages = [packages_by_id[package_id] for package_id in workspace_member_ids]
+
+          missing_manifests = []
+          for pkg in workspace_packages:
+              manifest_path = pkg.get("manifest_path")
+              if not manifest_path or not Path(manifest_path).is_file():
+                  missing_manifests.append((pkg.get("name", "<unnamed>"), manifest_path or "<missing>"))
+
+          if missing_manifests:
+              print("Workspace packages with missing Cargo.toml files:")
+              for name, manifest_path in missing_manifests:
+                  print(f"  - {name}: {manifest_path}")
+              raise SystemExit("One or more workspace package manifests are missing")
+
+          names = {pkg.get("name") for pkg in workspace_packages if pkg.get("name")}
+          required_package_groups = {
+              "gpui": {"gpui"},
+              "gpui_platform": {"gpui_platform", "gpui-platform"},
+              "gpui_facade": {"gpui_facade", "gpui-facade"},
           }
 
+          missing_required = []
+          for logical_name, candidates in required_package_groups.items():
+              if not (names & candidates):
+                  missing_required.append(f"{logical_name} ({', '.join(sorted(candidates))})")
+
+          if missing_required:
+              print("Workspace packages found:")
+              for name in sorted(names):
+                  print(f"  - {name}")
+              raise SystemExit(
+                  "Required GPUI workspace packages are missing: "
+                  + "; ".join(missing_required)
+              )
+
+          print("Workspace packages discovered by cargo metadata:")
+          rows = []
+          for pkg in sorted(workspace_packages, key=lambda p: (p.get("manifest_path", ""), p.get("name", ""))):
+              name = pkg.get("name", "<unnamed>")
+              manifest_path = pkg.get("manifest_path", "")
+              rows.append((name, manifest_path))
+              print(f"  - {name}: {manifest_path}")
+
+          manifest_list_path.write_text(
+              "".join(f"{name}\t{manifest_path}\n" for name, manifest_path in rows),
+              encoding="utf-8",
+          )
+          PY
+
+            echo "Checking every workspace package with cargo check --workspace --all-targets"
+            cargo check --workspace --all-targets
+
+            if [ "${DEBUG_LOGS_INPUT}" = "true" ]; then
+              echo "Per-package manifest validation list:"
+              cat "$RUNNER_TEMP/workspace-package-manifests.tsv"
+            fi
+
+            echo "All workspace package metadata and cargo check validation passed"
+          }
+
+          CURRENT_STAGE="capture gpui package metadata"
           GPUI_METADATA_FILE="$(capture_gpui_package_metadata)"
 
+          CURRENT_STAGE="prepare sparse output"
           copy_sparse_source_to_output
 
+          CURRENT_STAGE="capture upstream file dates"
+          UPSTREAM_DATE_SNAPSHOT="$(capture_upstream_file_dates_from_git)"
+          if [ ! -f "$UPSTREAM_DATE_SNAPSHOT" ]; then
+            echo "Date snapshot was not created correctly: $UPSTREAM_DATE_SNAPSHOT" >&2
+            exit 1
+          fi
+
+          CURRENT_STAGE="remove materialized exclusions"
           remove_materialized_exclusions "$OUT_DIR"
 
+          CURRENT_STAGE="rename root README"
           rename_original_root_readme
 
+          CURRENT_STAGE="generate gpui_facade manifest"
           generate_gpui_facade_cargo_toml "$GPUI_METADATA_FILE"
 
           write_embedded_file \
@@ -1158,36 +1902,48 @@ jobs:
             "FILE__CRATES_GPUI_FACADE_README_MD"
 
           write_embedded_file \
-            "crates/gpui_facade/src/main.rs" \
-            "FILE__CRATES_GPUI_FACADE_SRC_MAIN_RS"
+            "crates/gpui_facade/src/lib.rs" \
+            "FILE__CRATES_GPUI_FACADE_SRC_LIB_RS"
 
+          CURRENT_STAGE="amend root Cargo.toml workspace"
           amend_root_cargo_toml_for_workspace
 
-          generate_files_by_date_markdown
+          CURRENT_STAGE="validate gpui_facade features"
+          validate_gpui_facade_features
 
-          echo "Final output tree root:"
-          find "$OUT_DIR" -maxdepth 2 -mindepth 1 | sed "s#^$OUT_DIR/##" | sort | head -200
+          CURRENT_STAGE="generate FILES-BY-DATE-ZED.md"
+          generate_files_by_date_markdown "$UPSTREAM_DATE_SNAPSHOT"
 
+          if [ "${DEBUG_LOGS_INPUT}" = "true" ]; then
+            echo "Final output tree root:"
+            find "$OUT_DIR" -maxdepth 2 -mindepth 1 | sed "s#^$OUT_DIR/##" | sort | head -200
+          fi
+
+          CURRENT_STAGE="validate cargo metadata and check"
           validate_cargo_metadata
 
+          CURRENT_STAGE="create and push generated branch"
           cd "$OUT_DIR"
 
+          rm -rf .git
           git init
           git checkout -B "$OUTPUT_BRANCH"
 
           git add -A
 
-          echo "Staged files summary:"
-          git status --short
+          if [ "${DEBUG_LOGS_INPUT}" = "true" ]; then
+            echo "Staged files summary:"
+            git status --short
+          fi
 
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 1
           fi
 
-          git commit -m "${{ inputs.commit_message }}"
+          git commit -m "${COMMIT_MESSAGE_INPUT}"
 
-          git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git remote add origin "https://x-access-token:${PUSH_TOKEN}@github.com/${TARGET_REPOSITORY}.git"
 
           REMOTE_BRANCH_EXISTS=false
 
@@ -1204,7 +1960,7 @@ jobs:
             fi
           fi
 
-          if [ "${{ inputs.force_push }}" = "true" ]; then
+          if [ "${FORCE_PUSH_INPUT}" = "true" ]; then
             git push --force-with-lease origin "HEAD:$OUTPUT_BRANCH"
           else
             git push origin "HEAD:$OUTPUT_BRANCH"
@@ -1215,12 +1971,33 @@ jobs:
             echo ""
             echo "- Source: \`${UPSTREAM_REPO}\`"
             echo "- Source branch: \`${UPSTREAM_BRANCH}\`"
-            echo "- Output repo: \`${{ github.repository }}\`"
+            echo "- Output repo: \`${TARGET_REPOSITORY}\`"
             echo "- Output branch: \`${OUTPUT_BRANCH}\`"
             echo ""
             echo "Validation:"
             echo ""
             echo "\`\`\`text"
+            echo "gpui_facade feature mirror/reference validation"
             echo "cargo metadata --no-deps --format-version=1"
+            echo "cargo check --workspace --all-targets"
             echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Failure summary
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## fork-gpui job failed"
+            echo ""
+            echo "- Upstream repo: \`${{ inputs.upstream_repo }}\`"
+            echo "- Upstream branch/ref: \`${{ inputs.upstream_branch }}\`"
+            echo "- Requested output branch: \`${{ inputs.output_branch }}\`"
+            echo ""
+            echo "Earlier summary sections may contain a more specific validation report. The most common gpui_facade-specific failures are:"
+            echo ""
+            echo "- Upstream \`gpui\` added a feature that \`gpui_facade\` did not mirror."
+            echo "- \`gpui_facade\` references a dependency feature that is not defined in the referenced package."
+            echo "- A target-specific optional dependency was renamed or removed upstream."
           } >> "$GITHUB_STEP_SUMMARY"
