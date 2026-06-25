@@ -758,10 +758,8 @@ jobs:
           from datetime import datetime
           from pathlib import Path
           from zoneinfo import ZoneInfo
-          import subprocess
           import sys
 
-          source_root = Path(sys.argv[1]).resolve()
           output_root = Path(sys.argv[2]).resolve()
           output_path = Path(sys.argv[3]).resolve()
           denver = ZoneInfo("America/Denver")
@@ -778,68 +776,6 @@ jobs:
               "crates/gpui_facade/README.md",
               "crates/gpui_facade/src/lib.rs",
           }
-
-          generated_or_rewritten = {
-              "Cargo.toml",
-              "Cargo.lock",
-              "crates/gpui_facade/Cargo.toml",
-              "crates/gpui_facade/README.md",
-              "crates/gpui_facade/src/lib.rs",
-          }
-
-          def output_to_source_path(rel: str) -> str | None:
-              if rel == "README-zed.md":
-                  return "README.md"
-              if rel in generated_or_rewritten:
-                  return None
-              return rel
-
-          def load_latest_source_dates() -> dict[str, str]:
-              # One newest-to-oldest git log pass is behavior-equivalent to running
-              # `git log -1 --format=%cI -- <file>` for each file, but avoids thousands
-              # of subprocess calls on large source trees.
-              result = subprocess.run(
-                  [
-                      "git",
-                      "-C",
-                      str(source_root),
-                      "log",
-                      "--format=@@%cI",
-                      "--name-only",
-                  ],
-                  text=True,
-                  stdout=subprocess.PIPE,
-                  stderr=subprocess.PIPE,
-                  check=True,
-              )
-
-              latest: dict[str, str] = {}
-              current_date: str | None = None
-
-              for raw_line in result.stdout.splitlines():
-                  line = raw_line.strip()
-
-                  if not line:
-                      continue
-
-                  if line.startswith("@@"):
-                      stamp = line[2:]
-                      current_date = datetime.fromisoformat(
-                          stamp.replace("Z", "+00:00")
-                      ).astimezone(denver).date().isoformat()
-                      continue
-
-                  if current_date is None:
-                      continue
-
-                  latest.setdefault(line, current_date)
-
-              return latest
-
-          latest_source_dates = load_latest_source_dates()
-
-          def source_last_change_date(source_rel: str) -> str | None:
-              return latest_source_dates.get(source_rel)
 
           def filesystem_date(path: Path) -> str:
               return datetime.fromtimestamp(path.stat().st_mtime, denver).date().isoformat()
@@ -859,13 +795,7 @@ jobs:
               if rel in manifest_excludes:
                   continue
 
-              source_rel = output_to_source_path(rel)
-              date = source_last_change_date(source_rel) if source_rel is not None else None
-
-              if date is None:
-                  date = filesystem_date(path)
-
-              groups[date].append(rel)
+              groups[filesystem_date(path)].append(rel)
 
           lines = [
               "# Files by date changed in Zed",
@@ -874,8 +804,8 @@ jobs:
               "",
               "Dates are grouped using the Denver, Colorado timezone (America/Denver).",
               "",
-              "For files copied from Zed, dates come from the latest Git commit date that changed each file. Commit hashes and commit messages are intentionally omitted.",
-              "Generated or rewritten files that do not map directly to a Zed source file are grouped by their filesystem modified date from this workflow run.",
+              "Dates come from each file's filesystem modified time after the workflow has downloaded/generated the output tree.",
+              "Generated or rewritten files excluded from this manifest are intentionally omitted.",
               "",
           ]
 
