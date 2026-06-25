@@ -686,6 +686,22 @@ jobs:
           cargo metadata --no-deps
           cargo check --workspace --all-targets
 
+          {
+            echo "## Validation summary"
+            echo
+            echo "Validated generated branch with:"
+            echo "- cargo metadata --no-deps"
+            echo "- cargo check --workspace --all-targets"
+            echo
+            echo "Imported packages:"
+            python - <<'PY'
+          import json
+          crates = json.loads(r'''${{ steps.detect.outputs.crates_json }}''')
+          for package, item in sorted(crates.items()):
+              print(f"- {package}: {item['target']}")
+          PY
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Commit generated branch
         id: generated_commit
         shell: bash
