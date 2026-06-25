@@ -1,0 +1,1226 @@
+name: Fork branch and apply embedded gpui facade fixes
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: "Repository to copy from"
+        required: true
+        default: "zed-industries/zed"
+        type: string
+
+      upstream_branch:
+        description: "Branch to copy from upstream_repo"
+        required: true
+        default: "main"
+        type: string
+
+      output_branch:
+        description: "Branch to create in this repository. Leave empty for auto-generated name."
+        required: false
+        default: ""
+        type: string
+
+      commit_message:
+        description: "Commit message for embedded fixes"
+        required: true
+        default: "Add gpui facade crate"
+        type: string
+
+      force_push:
+        description: "Force push output branch if it already exists"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  EXCLUDE_PATTERNS: |
+    # Lines starting with "#" are comments.
+    # Real exclusions must NOT start with "#".
+    #
+    # You may exclude crates like:
+    # crates/auto_update/
+    # crates/benchmarks/
+    #
+    # The workflow will remove those crates from root Cargo.toml workspace
+    # members/default-members and add them to workspace.exclude before
+    # running cargo metadata.
+
+    .github/**
+    .devcontainer/**
+    .vscode/**
+    .editorconfig
+    .cloudflare/
+    extensions/workflows/
+    script/**
+    assets/**
+    extensions/glsl/
+    extensions/html/
+    extensions/proto/
+    extensions/test-extension/
+    tooling/compliance/
+    tooling/xtask/
+    .zed/**
+    .factory/**
+    .config/**
+    .agents/skills/**
+    ci/**
+    docs/**
+    nix/**
+    .git-blame-ignore-revs
+    .gitignore
+    .gitattributes
+    .mailmap
+    .prettierrc
+    .rules
+    AGENTS.md
+    CLAUDE.md
+    GEMINI.md
+    CODE_OF_CONDUCT.md
+    Dockerfile-*
+    Procfile
+    Procfile.*
+    *.nix
+    flake.lock
+    crates/gpui_facade/**
+    crates/gpui_component/**
+    crates/gpui_components/**
+    crates/gpui-component/**
+    crates/gpui-components/**
+    # **/*.lock
+    
+    # ---- root files ----
+    livekit.yaml
+    lychee.toml
+    renovate.json
+    typos.toml
+    debug.plist
+    compose.yml
+    clippy.toml
+
+    ## ---- safe to remove ----
+    crates/acp_thread/
+    crates/acp_tools/
+    crates/action_log/
+    crates/activity_indicator/
+    crates/agent/
+    crates/agent_servers/
+    crates/agent_settings/
+    crates/agent_skills/
+    crates/agent_ui/
+    crates/ai_onboarding/
+    crates/anthropic/
+    crates/askpass/
+    crates/assets/
+    crates/audio/
+    crates/auto_update/
+    crates/auto_update_helper/
+    crates/auto_update_ui/
+    crates/aws_http_client/
+    crates/bedrock/
+    crates/benchmarks/
+    crates/breadcrumbs/
+    crates/buffer_diff/
+    crates/call/
+    crates/channel/
+    crates/cli/
+    crates/client/
+    crates/clock/
+    crates/cloud_api_client/
+    crates/cloud_api_types/
+    crates/cloud_llm_client/
+    crates/codestral/
+    crates/collab/
+    crates/collab_ui/
+    crates/command_palette/
+    crates/command_palette_hooks/
+    crates/component/
+    crates/component_preview/
+    crates/context_server/
+    crates/copilot/
+    crates/copilot_chat/
+    crates/crashes/
+    crates/credentials_provider/
+    crates/csv_preview/
+    crates/dap/
+    crates/dap_adapters/
+    crates/db/
+    crates/debug_adapter_extension/
+    crates/debugger_tools/
+    crates/debugger_ui/
+    crates/deepseek/
+    crates/dev_container/
+    crates/diagnostics/
+    crates/docs_preprocessor/
+    crates/edit_prediction/
+    crates/edit_prediction_cli/
+    crates/edit_prediction_context/
+    crates/edit_prediction_metrics/
+    crates/edit_prediction_types/
+    crates/edit_prediction_ui/
+    crates/editor/
+    crates/editor_benchmarks/
+    crates/encoding_selector/
+    crates/env_var/
+    crates/etw_tracing/
+    crates/eval_cli/
+    crates/eval_utils/
+    crates/explorer_command_injector/
+    crates/extension/
+    crates/extension_api/
+    crates/extension_cli/
+    crates/extension_host/
+    crates/extensions_ui/
+    crates/feature_flags/
+    crates/feature_flags_macros/
+    crates/feedback/
+    crates/file_finder/
+    crates/file_icons/
+    crates/fs/
+    crates/fs_benchmarks/
+    crates/fuzzy/
+    crates/fuzzy_nucleo/
+    crates/git/
+    crates/git_hosting_providers/
+    crates/git_ui/
+    crates/go_to_line/
+    crates/google_ai/
+    crates/grammars/
+    crates/gpui_component_story/
+    crates/gpui_component_story_web/
+    crates/html_to_markdown/
+    crates/http_proxy/
+    crates/icons/
+    crates/image_viewer/
+    crates/input_latency_ui/
+    crates/inspector_ui/
+    crates/install_cli/
+    crates/journal/
+    crates/json_schema_store/
+    crates/keymap_editor/
+    crates/language/
+    crates/language_core/
+    crates/language_extension/
+    crates/language_model/
+    crates/language_model_core/
+    crates/language_models/
+    crates/language_models_cloud/
+    crates/language_onboarding/
+    crates/language_selector/
+    crates/language_tools/
+    crates/languages/
+    crates/line_ending_selector/
+    crates/livekit_api/
+    crates/livekit_client/
+    crates/lmstudio/
+    crates/lsp/
+    crates/markdown/
+    crates/markdown_preview/
+    crates/mermaid_render/
+    crates/menu/
+    crates/migrator/
+    crates/miniprofiler_ui/
+    crates/mistral/
+    crates/multi_buffer/
+    crates/net/
+    crates/node_runtime/
+    crates/notifications/
+    crates/oauth_callback_server/
+    crates/ollama/
+    crates/onboarding/
+    crates/opencode/
+    crates/open_ai/
+    crates/open_path_prompt/
+    crates/open_router/
+    crates/outline/
+    crates/outline_panel/
+    crates/panel/
+    crates/paths/
+    crates/picker/
+    crates/platform_title_bar/
+    crates/prettier/
+    crates/project/
+    crates/project_benchmarks/
+    crates/project_panel/
+    crates/project_symbols/
+    crates/prompt_store/
+    crates/proto/
+    crates/recent_projects/
+    crates/release_channel/
+    crates/remote/
+    crates/remote_connection/
+    crates/remote_server/
+    crates/repl/
+    crates/rope/
+    crates/rpc/
+    crates/sandbox/
+    crates/search/
+    crates/session/
+    crates/settings/
+    crates/settings_content/
+    crates/settings_json/
+    crates/settings_macros/
+    crates/settings_profile_selector/
+    crates/settings_ui/
+    crates/shell_command_parser/
+    crates/sidebar/
+    crates/snippet/
+    crates/snippet_provider/
+    crates/snippets_ui/
+    crates/sqlez/
+    crates/sqlez_macros/
+    crates/streaming_diff/
+    crates/svg_preview/
+    crates/system_specs/
+    crates/syntax_theme/
+    crates/tab_switcher/
+    crates/task/
+    crates/tasks_ui/
+    crates/telemetry/
+    crates/terminal_view/
+    crates/text/
+    crates/theme/
+    crates/theme_extension/
+    crates/theme_importer/
+    crates/theme_selector/
+    crates/theme_settings/
+    crates/time_format/
+    crates/title_bar/
+    crates/toolchain_selector/
+    crates/ui/
+    crates/ui_input/
+    crates/ui_macros/
+    crates/ui_prompt/
+    crates/vim/
+    crates/vim_mode_setting/
+    crates/watch/
+    crates/web_search/
+    crates/web_search_providers/
+    crates/which_key/
+    crates/windows_resources/
+    crates/workspace/
+    crates/worktree/
+    crates/worktree_benchmarks/
+    crates/x_ai/
+    crates/zed/
+    crates/zed_actions/
+    crates/zed_credentials_provider/
+    crates/zed_env_vars/
+    crates/zeta_prompt/
+    crates/zlog_settings/
+
+    # ---- be careful ----
+    crates/copilot_ui/
+    crates/schema_generator/
+    crates/terminal/
+    crates/telemetry_events/
+
+    # ---- must keep ----
+    # crates/reqwest_client/ <for wasm>
+    # tooling/perf
+    # crates/http_client_tls/ <for reqwest_client>
+    # crates/util/ <for http_client>
+
+  FILE__CRATES_GPUI_FACADE_CARGO_TOML: |
+    {{GPUI_PACKAGE_METADATA}}
+
+    [lints]
+    workspace = true
+
+    [lib]
+    path = "src/main.rs"
+
+    [features]
+    default = ["font-kit", "wayland", "x11", "windows-manifest"]
+
+    test-support = [
+        "gpui/test-support",
+        "gpui_platform/test-support",
+        "gpui_macos?/test-support",
+        "gpui_linux?/test-support",
+        "gpui_windows?/test-support",
+    ]
+
+    bench = ["gpui/bench"]
+    inspector = ["gpui/inspector", "gpui_macros/inspector"]
+    leak-detection = ["gpui/leak-detection"]
+
+    wayland = ["gpui/wayland", "gpui_platform/wayland", "gpui_linux?/wayland"]
+    x11 = ["gpui/x11", "gpui_platform/x11", "gpui_linux?/x11"]
+
+    screen-capture = [
+        "gpui/screen-capture",
+        "gpui_platform/screen-capture",
+        "gpui_macos?/screen-capture",
+        "gpui_linux?/screen-capture",
+        "gpui_windows?/screen-capture",
+    ]
+
+    windows-manifest = ["gpui/windows-manifest"]
+    input-latency-histogram = ["gpui/input-latency-histogram"]
+    profiler = ["gpui/profiler"]
+
+    font-kit = ["gpui_platform/font-kit", "gpui_macos?/font-kit"]
+    runtime_shaders = ["gpui_platform/runtime_shaders", "gpui_macos?/runtime_shaders"]
+
+    gpui_macros = ["dep:gpui_macros"]
+    gpui_web = ["dep:gpui_web"]
+    gpui_web_multithreaded = ["gpui_web", "gpui_web/multithreaded"]
+
+    gpui_macos = ["dep:gpui_macos"]
+    gpui_linux = ["dep:gpui_linux"]
+    gpui_windows = ["dep:gpui_windows"]
+
+    [dependencies]
+    gpui.workspace = true
+    gpui_platform.workspace = true
+    gpui_macros = { workspace = true, optional = true }
+
+    [target.'cfg(target_family = "wasm")'.dependencies]
+    gpui_web = { workspace = true, optional = true }
+
+    [target.'cfg(target_os = "macos")'.dependencies]
+    gpui_macos = { workspace = true, optional = true }
+
+    [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+    gpui_linux = { workspace = true, optional = true }
+
+    [target.'cfg(target_os = "windows")'.dependencies]
+    gpui_windows = { workspace = true, optional = true }
+
+  FILE__CRATES_GPUI_FACADE_README_MD: |
+    # gpui_facade
+
+    A facade crate that re-exports `gpui`, exposes `gpui_platform`, and can optionally expose related GPUI packages.
+
+    ## Example
+
+    ```toml
+    gpui = { package = "gpui_facade", workspace = true }
+    ```
+
+    ```rust
+    use gpui::*;
+
+    let app = gpui::gpui_platform::application();
+    ```
+
+    ## Optional package re-exports
+
+    ```toml
+    gpui = { package = "gpui_facade", workspace = true, features = ["gpui_web"] }
+    ```
+
+    ```rust
+    use gpui::*;
+
+    #[cfg(target_family = "wasm")]
+    let _ = gpui::gpui_web::WebPlatform::new(true);
+    ```
+
+  FILE__CRATES_GPUI_FACADE_SRC_MAIN_RS: |
+    #![doc = "Facade crate that re-exports GPUI plus optional GPUI-related crates."]
+
+    pub use gpui::*;
+
+    pub mod gpui_platform {
+        pub use ::gpui_platform::*;
+    }
+
+    #[cfg(any(feature = "gpui_macros", feature = "inspector"))]
+    pub mod gpui_macros {
+        pub use ::gpui_macros::*;
+    }
+
+    #[cfg(any(feature = "gpui_macros", feature = "inspector"))]
+    pub use ::gpui_macros::*;
+
+    #[cfg(all(target_family = "wasm", feature = "gpui_web"))]
+    pub mod gpui_web {
+        pub use ::gpui_web::*;
+    }
+
+    #[cfg(all(target_family = "wasm", feature = "gpui_web"))]
+    pub use ::gpui_web::*;
+
+    #[cfg(all(target_os = "macos", feature = "gpui_macos"))]
+    pub mod gpui_macos {
+        pub use ::gpui_macos::*;
+    }
+
+    #[cfg(all(target_os = "macos", feature = "gpui_macos"))]
+    pub use ::gpui_macos::*;
+
+    #[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "gpui_linux"))]
+    pub mod gpui_linux {
+        pub use ::gpui_linux::*;
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "gpui_linux"))]
+    pub use ::gpui_linux::*;
+
+    #[cfg(all(target_os = "windows", feature = "gpui_windows"))]
+    pub mod gpui_windows {
+        pub use ::gpui_windows::*;
+    }
+
+    #[cfg(all(target_os = "windows", feature = "gpui_windows"))]
+    pub use ::gpui_windows::*;
+
+concurrency:
+  group: fork-branch-apply-embedded-gpui-facade-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  generate-branch:
+    name: Generate modified branch
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Sparse clone upstream, validate, and create generated branch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config --global init.defaultBranch main
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          UPSTREAM_REPO="${{ inputs.upstream_repo }}"
+          UPSTREAM_BRANCH="${{ inputs.upstream_branch }}"
+
+          OUTPUT_BRANCH="${{ inputs.output_branch }}"
+          if [ -z "$OUTPUT_BRANCH" ]; then
+            SAFE_REPO="$(printf '%s' "$UPSTREAM_REPO" | tr '/:@ ' '----')"
+            SAFE_BRANCH="$(printf '%s' "$UPSTREAM_BRANCH" | tr '/:@ ' '----')"
+            OUTPUT_BRANCH="generated-${SAFE_REPO}-${SAFE_BRANCH}-${{ github.run_number }}"
+          fi
+
+          echo "Upstream repo: ${UPSTREAM_REPO}"
+          echo "Upstream branch: ${UPSTREAM_BRANCH}"
+          echo "Output branch: ${OUTPUT_BRANCH}"
+
+          SOURCE_DIR="$RUNNER_TEMP/source"
+          OUT_DIR="$RUNNER_TEMP/out"
+
+          rm -rf "$SOURCE_DIR" "$OUT_DIR"
+          mkdir -p "$SOURCE_DIR" "$OUT_DIR"
+
+          cd "$SOURCE_DIR"
+
+          git init
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+
+          git config core.sparseCheckout true
+          git config core.sparseCheckoutCone false
+
+          SPARSE_FILE=".git/info/sparse-checkout"
+          : > "$SPARSE_FILE"
+
+          # Include everything recursively first.
+          echo "/**" >> "$SPARSE_FILE"
+
+          # Convert EXCLUDE_PATTERNS into sparse-checkout exclusion rules.
+          printf '%s\n' "${EXCLUDE_PATTERNS}" | while IFS= read -r pattern; do
+            pattern="${pattern%$'\r'}"
+
+            case "$pattern" in
+              "" ) continue ;;
+              \#* ) continue ;;
+            esac
+
+            if [[ "$pattern" == \!* ]]; then
+              echo "${pattern:1}" >> "$SPARSE_FILE"
+            else
+              echo "!$pattern" >> "$SPARSE_FILE"
+            fi
+          done
+
+          # Force-include files needed by the generator and metadata check.
+          {
+            echo "/Cargo.toml"
+            echo "/Cargo.lock"
+            echo "/rust-toolchain.toml"
+            echo "/rustfmt.toml"
+            echo "/crates/"
+            echo "/crates/**"
+            echo "/crates/gpui/"
+            echo "/crates/gpui/**"
+            echo "/crates/gpui/Cargo.toml"
+            echo "/crates/gpui_facade/"
+            echo "/crates/gpui_facade/**"
+          } >> "$SPARSE_FILE"
+
+          echo "Sparse checkout rules:"
+          cat "$SPARSE_FILE"
+
+          git fetch \
+            --filter=blob:none \
+            upstream \
+            "$UPSTREAM_BRANCH"
+
+          git checkout --detach FETCH_HEAD
+
+          echo "Sparse source checkout root:"
+          find . -maxdepth 2 -mindepth 1 -not -path './.git*' | sort | head -200
+
+          capture_gpui_package_metadata() {
+            local metadata_file="$RUNNER_TEMP/gpui-package-metadata.toml"
+
+            python3 - "$metadata_file" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          src = Path("crates/gpui/Cargo.toml")
+          out_file = Path(sys.argv[1])
+
+          if not src.exists():
+              raise SystemExit("Missing required file: crates/gpui/Cargo.toml")
+
+          text = src.read_text()
+
+          match = re.search(r"(?ms)^\[package\]\n(.*?)(?=^\[)", text)
+          if not match:
+              raise SystemExit("Could not find [package] section in crates/gpui/Cargo.toml")
+
+          package_body = match.group(1).rstrip() + "\n"
+
+          overrides = {
+              "name": '"gpui_facade"',
+              "publish": "false",
+          }
+
+          for key, value in overrides.items():
+              pattern = rf'(?m)^{re.escape(key)}\s*=.*$'
+              line = f"{key} = {value}"
+
+              if re.search(pattern, package_body):
+                  package_body = re.sub(pattern, line, package_body)
+              else:
+                  package_body += line + "\n"
+
+          metadata = "[package]\n" + package_body.rstrip() + "\n"
+          out_file.write_text(metadata)
+          PY
+
+            echo "$metadata_file"
+          }
+
+          copy_sparse_source_to_output() {
+            echo "Copying sparse source checkout into output directory"
+
+            cd "$SOURCE_DIR"
+
+            local rsync_excludes="$RUNNER_TEMP/rsync-excludes"
+            : > "$rsync_excludes"
+
+            printf '%s\n' "${EXCLUDE_PATTERNS}" | while IFS= read -r pattern; do
+              pattern="${pattern%$'\r'}"
+
+              case "$pattern" in
+                "" ) continue ;;
+                \#* ) continue ;;
+                \!* ) continue ;;
+              esac
+
+              printf '%s\n' "$pattern" >> "$rsync_excludes"
+            done
+
+            printf '%s\n' ".git/" >> "$rsync_excludes"
+
+            rsync -a \
+              --delete \
+              --exclude-from="$rsync_excludes" \
+              "$SOURCE_DIR"/ \
+              "$OUT_DIR"/
+
+            echo "Output tree after source copy:"
+            find "$OUT_DIR" -maxdepth 2 -mindepth 1 | sed "s#^$OUT_DIR/##" | sort | head -200
+          }
+
+          remove_materialized_exclusions() {
+            local dir="$1"
+
+            echo "Removing materialized exclusions from: $dir"
+
+            cd "$dir"
+
+            while IFS= read -r pattern; do
+              pattern="${pattern%$'\r'}"
+
+              case "$pattern" in
+                "" ) continue ;;
+                \#* ) continue ;;
+                \!* ) continue ;;
+              esac
+
+              if [[ "$pattern" == */** ]]; then
+                base="${pattern%/**}"
+                rm -rf -- "$base"
+              else
+                rm -rf -- $pattern 2>/dev/null || true
+              fi
+            done <<< "${EXCLUDE_PATTERNS}"
+
+            find . -depth -type d -empty -not -path './.git/*' -delete
+          }
+
+          generate_gpui_facade_cargo_toml() {
+            local metadata_file="$1"
+            local path="$OUT_DIR/crates/gpui_facade/Cargo.toml"
+
+            echo "Generating: crates/gpui_facade/Cargo.toml"
+            mkdir -p "$(dirname "$path")"
+
+            python3 - "$metadata_file" "$path" <<'PY'
+          from pathlib import Path
+          import os
+          import re
+          import sys
+
+          metadata_file = Path(sys.argv[1])
+          dst = Path(sys.argv[2])
+
+          template = os.environ["FILE__CRATES_GPUI_FACADE_CARGO_TOML"]
+          metadata = metadata_file.read_text().rstrip()
+
+          output = template.replace("{{GPUI_PACKAGE_METADATA}}", metadata)
+
+          missing = re.findall(r"\{\{[A-Z0-9_]+\}\}", output)
+          if missing:
+              raise SystemExit(
+                  "Unresolved placeholders: " + ", ".join(sorted(set(missing)))
+              )
+
+          dst.write_text(output.rstrip() + "\n")
+          PY
+          }
+
+          write_embedded_file() {
+            local path="$1"
+            local env_name="$2"
+            local full_path="$OUT_DIR/$path"
+
+            echo "Writing: $path"
+            mkdir -p "$(dirname "$full_path")"
+            printf '%s' "${!env_name}" > "$full_path"
+          }
+
+          rename_original_root_readme() {
+            local src="$OUT_DIR/README.md"
+            local dst="$OUT_DIR/README-zed.md"
+
+            if [ -f "$src" ]; then
+              echo "Renaming original root README.md to README-zed.md"
+              rm -f "$dst"
+              mv "$src" "$dst"
+            else
+              echo "No root README.md found to rename"
+            fi
+          }
+
+          generate_files_by_date_markdown() {
+            local output_path="$OUT_DIR/FILES-BY-DATE-ZED.md"
+
+            echo "Generating: FILES-BY-DATE-ZED.md"
+
+            cd "$OUT_DIR"
+
+            python3 - "$SOURCE_DIR" "$OUT_DIR" "$output_path" <<'PY'
+          from collections import defaultdict
+          from datetime import datetime
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+          import subprocess
+          import sys
+
+          source_root = Path(sys.argv[1]).resolve()
+          output_root = Path(sys.argv[2]).resolve()
+          output_path = Path(sys.argv[3]).resolve()
+          denver = ZoneInfo("America/Denver")
+
+          # Hard-coded exclusions for FILES-BY-DATE-ZED.md.
+          # These files are generated, rewritten, renamed, or intentionally omitted
+          # from the date-grouped Zed source-file manifest.
+          manifest_excludes = {
+              "Cargo.toml",
+              "Cargo.lock",
+              "README.md",
+              "README-zed.md",
+              "crates/gpui_facade/Cargo.toml",
+              "crates/gpui_facade/README.md",
+              "crates/gpui_facade/src/main.rs",
+          }
+
+          generated_or_rewritten = {
+              "Cargo.toml",
+              "Cargo.lock",
+              "crates/gpui_facade/Cargo.toml",
+              "crates/gpui_facade/README.md",
+              "crates/gpui_facade/src/main.rs",
+          }
+
+          def output_to_source_path(rel: str) -> str | None:
+              if rel == "README-zed.md":
+                  return "README.md"
+              if rel in generated_or_rewritten:
+                  return None
+              return rel
+
+          def source_last_change_date(source_rel: str) -> str | None:
+              result = subprocess.run(
+                  [
+                      "git",
+                      "-C",
+                      str(source_root),
+                      "log",
+                      "-1",
+                      "--format=%cI",
+                      "--",
+                      source_rel,
+                  ],
+                  text=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  check=False,
+              )
+              stamp = result.stdout.strip()
+              if not stamp:
+                  return None
+              return datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone(denver).date().isoformat()
+
+          def filesystem_date(path: Path) -> str:
+              return datetime.fromtimestamp(path.stat().st_mtime, denver).date().isoformat()
+
+          groups = defaultdict(list)
+
+          for path in output_root.rglob("*"):
+              if not path.is_file():
+                  continue
+
+              rel = path.relative_to(output_root).as_posix()
+
+              if rel == output_path.name:
+                  continue
+              if rel.startswith(".git/"):
+                  continue
+              if rel in manifest_excludes:
+                  continue
+
+              source_rel = output_to_source_path(rel)
+              date = source_last_change_date(source_rel) if source_rel is not None else None
+
+              if date is None:
+                  date = filesystem_date(path)
+
+              groups[date].append(rel)
+
+          lines = [
+              "# Files by date changed in Zed",
+              "",
+              "Latest dates are listed first.",
+              "",
+              "Dates are grouped using the Denver, Colorado timezone (America/Denver).",
+              "",
+              "For files copied from Zed, dates come from the latest Git commit date that changed each file. Commit hashes and commit messages are intentionally omitted.",
+              "Generated or rewritten files that do not map directly to a Zed source file are grouped by their filesystem modified date from this workflow run.",
+              "",
+          ]
+
+          for date in sorted(groups.keys(), reverse=True):
+              lines.append(f"## {date}")
+              lines.append("")
+
+              for rel in sorted(groups[date]):
+                  lines.append(f"- `{rel}`")
+
+              lines.append("")
+
+          output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+          PY
+          }
+
+          amend_root_cargo_toml_for_workspace() {
+            echo "Amending root Cargo.toml workspace members/default-members/exclude"
+
+            cd "$OUT_DIR"
+
+            python3 - <<'PY'
+          from pathlib import Path
+          import fnmatch
+          import os
+          import re
+
+          ROOT_CARGO = Path("Cargo.toml")
+
+          if not ROOT_CARGO.exists():
+              raise SystemExit("Missing root Cargo.toml")
+
+          text = ROOT_CARGO.read_text()
+
+          generated_member = "crates/gpui_facade"
+
+          WORKSPACE_PREFIXES = (
+              "crates/",
+              "extensions/",
+              "tooling/",
+          )
+
+          def clean_pattern(raw: str) -> str | None:
+              pattern = raw.strip().rstrip("\r")
+
+              if not pattern:
+                  return None
+              if pattern.startswith("#"):
+                  return None
+              if pattern.startswith("!"):
+                  return None
+
+              return pattern.lstrip("./")
+
+          exclude_patterns = []
+
+          for raw in os.environ.get("EXCLUDE_PATTERNS", "").splitlines():
+              pattern = clean_pattern(raw)
+              if pattern:
+                  exclude_patterns.append(pattern)
+
+          def matches_exclude_pattern(workspace_path: str, pattern: str) -> bool:
+              value = workspace_path.strip().rstrip("/")
+              pat = pattern.strip().rstrip("\r").lstrip("./")
+
+              if not pat:
+                  return False
+
+              if pat.endswith("/"):
+                  base = pat.rstrip("/")
+                  return value == base or value.startswith(base + "/")
+
+              if pat.endswith("/**"):
+                  base = pat[:-3].rstrip("/")
+                  return value == base or value.startswith(base + "/")
+
+              if pat.endswith("/*"):
+                  base = pat[:-2].rstrip("/")
+                  if not value.startswith(base + "/"):
+                      return False
+                  rest = value[len(base) + 1:]
+                  return "/" not in rest
+
+              if fnmatch.fnmatch(value, pat):
+                  return True
+
+              if fnmatch.fnmatch(value + "/", pat):
+                  return True
+
+              return False
+
+          def is_workspace_path(value: str) -> bool:
+              return value.startswith(WORKSPACE_PREFIXES)
+
+          workspace_match = re.search(r"(?ms)^\[workspace\]\s*(.*?)(?=^\[|\Z)", text)
+          if not workspace_match:
+              raise SystemExit("Could not find [workspace] table in root Cargo.toml")
+
+          ws_start, ws_end = workspace_match.span()
+          workspace_block = text[ws_start:ws_end]
+
+          def read_array(block: str, key: str) -> list[str]:
+              # Handles both:
+              #   key = ["a", "b"]
+              # and:
+              #   key = [
+              #       "a",
+              #       "b",
+              #   ]
+              pattern = re.compile(
+                  rf"(?ms)^(\s*{re.escape(key)}\s*=\s*)\[(.*?)\]"
+              )
+
+              match = pattern.search(block)
+              if not match:
+                  return []
+
+              body = match.group(2)
+
+              values = []
+              for string_match in re.finditer(r'"([^"]+)"', body):
+                  values.append(string_match.group(1))
+
+              return values
+
+          def unique_preserve_order(values: list[str]) -> list[str]:
+              seen = set()
+              result = []
+
+              for value in values:
+                  if value in seen:
+                      continue
+                  seen.add(value)
+                  result.append(value)
+
+              return result
+
+          def write_array(block: str, key: str, values: list[str]) -> str:
+              values = unique_preserve_order(values)
+
+              replacement = f"{key} = [\n"
+              for value in values:
+                  replacement += f'    "{value}",\n'
+              replacement += "]"
+
+              pattern = re.compile(
+                  rf"(?ms)^(\s*{re.escape(key)}\s*=\s*)\[(.*?)\]"
+              )
+
+              match = pattern.search(block)
+
+              if match:
+                  return block[:match.start()] + replacement + block[match.end():]
+
+              # Insert missing arrays near the top of [workspace].
+              header_match = re.search(r"(?m)^\[workspace\]\s*$", block)
+              if not header_match:
+                  raise SystemExit("Could not find [workspace] header while writing array")
+
+              insert_at = header_match.end()
+              return block[:insert_at] + "\n" + replacement + "\n" + block[insert_at:]
+
+          def cargo_manifest_exists(workspace_path: str) -> bool:
+              if "*" in workspace_path:
+                  # Cargo supports glob members. Do not try to check a literal path.
+                  return True
+
+              return (Path(workspace_path) / "Cargo.toml").exists()
+
+          members = read_array(workspace_block, "members")
+          default_members = read_array(workspace_block, "default-members")
+          existing_exclude = read_array(workspace_block, "exclude")
+
+          all_workspace_paths = unique_preserve_order(members + default_members)
+
+          excluded_by_pattern = set()
+
+          for workspace_path in all_workspace_paths:
+              if workspace_path == generated_member:
+                  continue
+
+              if not is_workspace_path(workspace_path):
+                  continue
+
+              for pattern in exclude_patterns:
+                  if matches_exclude_pattern(workspace_path, pattern):
+                      excluded_by_pattern.add(workspace_path)
+                      break
+
+          missing_members = set()
+
+          for workspace_path in members:
+              if workspace_path == generated_member:
+                  continue
+
+              if not is_workspace_path(workspace_path):
+                  continue
+
+              if not cargo_manifest_exists(workspace_path):
+                  missing_members.add(workspace_path)
+
+          remove_from_workspace = excluded_by_pattern | missing_members
+
+          print("Workspace paths excluded by EXCLUDE_PATTERNS:")
+          if excluded_by_pattern:
+              for item in sorted(excluded_by_pattern):
+                  print(f"  - {item}")
+          else:
+              print("  - none")
+
+          print("Workspace members removed because Cargo.toml is missing:")
+          if missing_members:
+              for item in sorted(missing_members):
+                  print(f"  - {item}")
+          else:
+              print("  - none")
+
+          new_members = []
+
+          for item in members:
+              if item in remove_from_workspace:
+                  print(f"Removing {item!r} from [workspace].members")
+                  continue
+              new_members.append(item)
+
+          if generated_member not in new_members:
+              print(f"Adding {generated_member!r} to [workspace].members")
+              new_members.append(generated_member)
+
+          member_set = set(new_members)
+
+          new_default_members = []
+
+          for item in default_members:
+              if item in remove_from_workspace:
+                  print(f"Removing {item!r} from [workspace].default-members because it is excluded/missing")
+                  continue
+
+              if item not in member_set:
+                  print(f"Removing {item!r} from [workspace].default-members because it is not in members")
+                  continue
+
+              new_default_members.append(item)
+
+          new_exclude = unique_preserve_order(
+              existing_exclude + sorted(remove_from_workspace)
+          )
+
+          # Do not exclude the generated crate.
+          new_exclude = [item for item in new_exclude if item != generated_member]
+
+          workspace_block = write_array(workspace_block, "members", new_members)
+          workspace_block = write_array(workspace_block, "default-members", new_default_members)
+          workspace_block = write_array(workspace_block, "exclude", new_exclude)
+
+          text = text[:ws_start] + workspace_block + text[ws_end:]
+          ROOT_CARGO.write_text(text)
+
+          print("Final [workspace].members contains crates/gpui_facade:", generated_member in new_members)
+          print("Final [workspace].default-members:")
+          for item in new_default_members:
+              print(f"  - {item}")
+
+          print("Root Cargo.toml workspace amendment completed")
+          PY
+          }
+
+          validate_cargo_metadata() {
+            echo "Validating with cargo metadata before creating output branch"
+
+            cd "$OUT_DIR"
+
+            if [ ! -f Cargo.toml ]; then
+              echo "Missing root Cargo.toml in output directory."
+              exit 1
+            fi
+
+            if [ ! -f crates/gpui_facade/Cargo.toml ]; then
+              echo "Missing generated crates/gpui_facade/Cargo.toml."
+              exit 1
+            fi
+
+            cargo metadata \
+              --no-deps \
+              --format-version=1 \
+              > "$RUNNER_TEMP/cargo-metadata.json"
+
+            python3 - "$RUNNER_TEMP/cargo-metadata.json" <<'PY'
+          import json
+          import sys
+
+          metadata_path = sys.argv[1]
+
+          with open(metadata_path, "r", encoding="utf-8") as f:
+              metadata = json.load(f)
+
+          packages = metadata.get("packages", [])
+          names = {pkg.get("name") for pkg in packages}
+
+          if "gpui_facade" not in names:
+              print("Workspace packages found:")
+              for name in sorted(n for n in names if n):
+                  print(f"  - {name}")
+              raise SystemExit("cargo metadata succeeded, but gpui_facade is not present in workspace metadata")
+
+          for pkg in packages:
+              if pkg.get("name") == "gpui_facade":
+                  manifest_path = pkg.get("manifest_path", "")
+                  print(f"Found gpui_facade manifest: {manifest_path}")
+                  break
+          PY
+
+            echo "cargo metadata validation passed"
+          }
+
+          GPUI_METADATA_FILE="$(capture_gpui_package_metadata)"
+
+          copy_sparse_source_to_output
+
+          remove_materialized_exclusions "$OUT_DIR"
+
+          rename_original_root_readme
+
+          generate_gpui_facade_cargo_toml "$GPUI_METADATA_FILE"
+
+          write_embedded_file \
+            "crates/gpui_facade/README.md" \
+            "FILE__CRATES_GPUI_FACADE_README_MD"
+
+          write_embedded_file \
+            "crates/gpui_facade/src/main.rs" \
+            "FILE__CRATES_GPUI_FACADE_SRC_MAIN_RS"
+
+          amend_root_cargo_toml_for_workspace
+
+          generate_files_by_date_markdown
+
+          echo "Final output tree root:"
+          find "$OUT_DIR" -maxdepth 2 -mindepth 1 | sed "s#^$OUT_DIR/##" | sort | head -200
+
+          validate_cargo_metadata
+
+          cd "$OUT_DIR"
+
+          git init
+          git checkout -B "$OUTPUT_BRANCH"
+
+          git add -A
+
+          echo "Staged files summary:"
+          git status --short
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 1
+          fi
+
+          git commit -m "${{ inputs.commit_message }}"
+
+          git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+
+          REMOTE_BRANCH_EXISTS=false
+
+          if git ls-remote --exit-code --heads origin "$OUTPUT_BRANCH" >/dev/null 2>&1; then
+            REMOTE_BRANCH_EXISTS=true
+            git fetch --no-tags origin "$OUTPUT_BRANCH:refs/remotes/origin/$OUTPUT_BRANCH"
+          fi
+
+          if [ "$REMOTE_BRANCH_EXISTS" = "true" ]; then
+            if git diff --quiet "origin/$OUTPUT_BRANCH" HEAD -- .; then
+              echo "Remote branch '$OUTPUT_BRANCH' already has the same files."
+              echo "Skipping push to avoid changing the branch commit unnecessarily."
+              exit 0
+            fi
+          fi
+
+          if [ "${{ inputs.force_push }}" = "true" ]; then
+            git push --force-with-lease origin "HEAD:$OUTPUT_BRANCH"
+          else
+            git push origin "HEAD:$OUTPUT_BRANCH"
+          fi
+
+          {
+            echo "## Generated branch"
+            echo ""
+            echo "- Source: \`${UPSTREAM_REPO}\`"
+            echo "- Source branch: \`${UPSTREAM_BRANCH}\`"
+            echo "- Output repo: \`${{ github.repository }}\`"
+            echo "- Output branch: \`${OUTPUT_BRANCH}\`"
+            echo ""
+            echo "Validation:"
+            echo ""
+            echo "\`\`\`text"
+            echo "cargo metadata --no-deps --format-version=1"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"

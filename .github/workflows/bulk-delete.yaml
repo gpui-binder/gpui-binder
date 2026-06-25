@@ -1,0 +1,195 @@
+name: Bulk Delete Workflow Runs
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_workflow:
+        description: "Workflow filename to clean. Leave empty to clean all workflows on main."
+        required: false
+        default: ""
+        type: string
+
+      days_to_keep:
+        description: "Manual run only: keep runs newer than this many days"
+        required: true
+        default: "14"
+        type: string
+
+  schedule:
+    # Every day at 17:33 GMT+9 = 08:33 UTC.
+    # Scheduled runs always keep the last 14 days.
+    - cron: "33 8 * * *"
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: bulk-delete-workflow-runs
+  cancel-in-progress: false
+
+jobs:
+  delete-runs:
+    name: Delete old workflow runs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Delete old workflow runs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TARGET_WORKFLOW: ${{ github.event.inputs.target_workflow || '' }}
+          MANUAL_DAYS_TO_KEEP: ${{ github.event.inputs.days_to_keep || '14' }}
+          EVENT_NAME: ${{ github.event_name }}
+          CURRENT_WORKFLOW_REF: ${{ github.workflow_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            DAYS_TO_KEEP="14"
+            TARGET_WORKFLOW=""
+          else
+            DAYS_TO_KEEP="$MANUAL_DAYS_TO_KEEP"
+          fi
+
+          if ! [[ "$DAYS_TO_KEEP" =~ ^[0-9]+$ ]]; then
+            echo "::error::days_to_keep must be a non-negative integer."
+            exit 1
+          fi
+
+          if [ "$DAYS_TO_KEEP" -gt 3650 ]; then
+            echo "::error::days_to_keep is too large. Maximum allowed value is 3650."
+            exit 1
+          fi
+
+          if [ -n "$TARGET_WORKFLOW" ]; then
+            if ! [[ "$TARGET_WORKFLOW" =~ ^[A-Za-z0-9._-]+\.ya?ml$ ]]; then
+              echo "::error::target_workflow must be a workflow filename ending in .yml or .yaml, without slashes."
+              exit 1
+            fi
+          fi
+
+          echo "Repository: $REPO"
+          echo "Event: $EVENT_NAME"
+          echo "Target workflow: ${TARGET_WORKFLOW:-<all workflows on main>}"
+          echo "Keeping workflow runs from the last $DAYS_TO_KEEP day(s)"
+
+          CUTOFF_DATE="$(date -u -d "$DAYS_TO_KEEP days ago" +"%Y-%m-%dT%H:%M:%SZ")"
+          echo "Deleting runs older than: $CUTOFF_DATE"
+
+          current_workflow_file="$(
+            printf '%s\n' "$CURRENT_WORKFLOW_REF" \
+              | sed -n 's#^.*/\.github/workflows/\([^@]*\)@.*$#\1#p'
+          )"
+
+          echo "Cleanup workflow file: ${current_workflow_file:-<unknown>}"
+
+          workflows_file="$(mktemp)"
+          runs_file="$(mktemp)"
+          candidates_file="$(mktemp)"
+
+          cleanup() {
+            rm -f "$workflows_file" "$runs_file" "$candidates_file"
+          }
+          trap cleanup EXIT
+
+          if [ -n "$TARGET_WORKFLOW" ]; then
+            printf '%s\n' "$TARGET_WORKFLOW" > "$workflows_file"
+          else
+            echo "Fetching workflow files from main..."
+
+            gh api "/repos/$REPO/contents/.github/workflows?ref=main" \
+              --jq '.[] | select(.type == "file") | select(.name | test("\\.ya?ml$")) | .name' \
+              > "$workflows_file"
+          fi
+
+          if [ ! -s "$workflows_file" ]; then
+            echo "No workflows found."
+            exit 0
+          fi
+
+          echo ""
+          echo "Workflows to clean:"
+          cat "$workflows_file"
+
+          total_deleted=0
+          total_failed=0
+
+          while IFS= read -r workflow; do
+            if [ -z "$workflow" ]; then
+              continue
+            fi
+
+            if [ -n "$current_workflow_file" ] && [ "$workflow" = "$current_workflow_file" ]; then
+              echo ""
+              echo "Skipping cleanup workflow itself: $workflow"
+              continue
+            fi
+
+            echo ""
+            echo "Checking workflow: $workflow"
+
+            : > "$runs_file"
+            : > "$candidates_file"
+
+            if ! gh api --paginate "/repos/$REPO/actions/workflows/$workflow/runs?per_page=100" \
+              --jq '
+                .workflow_runs[]
+                | [.id, .created_at, .status, (.conclusion // ""), (.display_title // "")]
+                | @tsv
+              ' > "$runs_file"; then
+              echo "::warning::Failed to fetch runs for workflow: $workflow"
+              total_failed=$((total_failed + 1))
+              continue
+            fi
+
+            if [ ! -s "$runs_file" ]; then
+              echo "No runs found."
+              continue
+            fi
+
+            awk -F'\t' -v cutoff="$CUTOFF_DATE" '$2 < cutoff { print }' "$runs_file" > "$candidates_file"
+
+            if [ ! -s "$candidates_file" ]; then
+              echo "No runs older than cutoff."
+              continue
+            fi
+
+            count="$(wc -l < "$candidates_file" | tr -d ' ')"
+            echo "Deleting $count old run(s)."
+
+            while IFS=$'\t' read -r run_id created_at status conclusion title; do
+              if [ -z "$run_id" ]; then
+                continue
+              fi
+
+              echo "Deleting run $run_id | $created_at | $status | ${conclusion:-n/a} | ${title:-n/a}"
+
+              if gh api \
+                --method DELETE \
+                "/repos/$REPO/actions/runs/$run_id" \
+                --silent; then
+                total_deleted=$((total_deleted + 1))
+              else
+                echo "::warning::Failed to delete run ID: $run_id"
+                total_failed=$((total_failed + 1))
+              fi
+
+              sleep 0.5
+            done < "$candidates_file"
+          done < "$workflows_file"
+
+          echo ""
+          echo "Cleanup summary"
+          echo "---------------"
+          echo "Deleted runs: $total_deleted"
+          echo "Failures: $total_failed"
+
+          if [ "$total_failed" -gt 0 ]; then
+            echo "::error::Cleanup completed with $total_failed failure(s)."
+            exit 1
+          fi
+
+          echo "Cleanup complete."

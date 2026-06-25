@@ -1,0 +1,282 @@
+name: Generate GPUI Nightly
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: "Repository Source of gpui (user/repo)"
+        required: true
+        default: "zed-industries/zed"
+        type: string
+
+      upstream_branch:
+        description: "Branch from gpui source repo"
+        required: true
+        default: "main"
+        type: string
+
+      source_repo:
+        description: "Repository Source of gpui-component (user/repo)"
+        required: true
+        default: "longbridge/gpui-component"
+        type: string
+
+      source_ref:
+        description: "Branch, tag, or SHA from gpui-component source repo"
+        required: true
+        default: "main"
+        type: string
+
+      fork_output_branch:
+        description: "Intermediate branch created by fork-gpui.yaml"
+        required: true
+        default: "generated-zed-nightly"
+        type: string
+
+      bind_target_branch:
+        description: "Final branch created by bind-gpui-component.yaml"
+        required: true
+        default: "generated-gpui-nightly"
+        type: string
+
+      force_push:
+        description: "Force push generated branches if they already exist"
+        required: true
+        default: true
+        type: boolean
+
+      fail_on_warnings:
+        description: "Fail check-cargo-local-dependencies.yaml when warnings are found"
+        required: true
+        default: false
+        type: boolean
+
+  schedule:
+    # 17:42 GMT+9 / Asia-Tokyo is 08:42 UTC.
+    - cron: "42 8 * * *"
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: generate-gpui-nightly
+  cancel-in-progress: false
+
+jobs:
+  nightly:
+    name: Generate zed/gpui nightly branches
+    runs-on: ubuntu-latest
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      WORKFLOW_REF: ${{ github.ref_name }}
+
+      UPSTREAM_REPO: ${{ inputs.upstream_repo || 'zed-industries/zed' }}
+      UPSTREAM_BRANCH: ${{ inputs.upstream_branch || 'main' }}
+      SOURCE_REPO: ${{ inputs.source_repo || 'longbridge/gpui-component' }}
+      SOURCE_REF: ${{ inputs.source_ref || 'main' }}
+      FORK_OUTPUT_BRANCH: ${{ inputs.fork_output_branch || 'generated-zed-nightly' }}
+      BIND_TARGET_BRANCH: ${{ inputs.bind_target_branch || 'generated-gpui-nightly' }}
+      FORCE_PUSH: ${{ inputs.force_push == false && 'false' || 'true' }}
+      FAIL_ON_WARNINGS: ${{ inputs.fail_on_warnings == true && 'true' || 'false' }}
+
+    steps:
+      - name: Show nightly inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Workflow ref: ${WORKFLOW_REF}"
+          echo "Repository: ${GH_REPO}"
+          echo "Upstream repo: ${UPSTREAM_REPO}"
+          echo "Upstream branch: ${UPSTREAM_BRANCH}"
+          echo "Fork output branch: ${FORK_OUTPUT_BRANCH}"
+          echo "gpui-component source repo: ${SOURCE_REPO}"
+          echo "gpui-component source ref: ${SOURCE_REF}"
+          echo "Bind target branch: ${BIND_TARGET_BRANCH}"
+          echo "Force push: ${FORCE_PUSH}"
+          echo "Fail on warnings: ${FAIL_ON_WARNINGS}"
+
+      - name: Run fork, bind, and Cargo dependency check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          wait_for_workflow_run() {
+            local workflow_file="$1"
+            local started_at="$2"
+
+            echo "Waiting for workflow run to appear: ${workflow_file}"
+
+            local run_id=""
+
+            for i in $(seq 1 60); do
+              run_id="$(
+                gh run list \
+                  --repo "${GH_REPO}" \
+                  --workflow "${workflow_file}" \
+                  --branch "${WORKFLOW_REF}" \
+                  --event workflow_dispatch \
+                  --limit 30 \
+                  --json databaseId,createdAt,status \
+                | jq -r --arg started_at "${started_at}" '
+                    map(select(.createdAt >= $started_at))
+                    | sort_by(.createdAt)
+                    | reverse
+                    | .[0].databaseId // empty
+                  '
+              )"
+
+              if [ -n "${run_id}" ]; then
+                break
+              fi
+
+              sleep 5
+            done
+
+            if [ -z "${run_id}" ]; then
+              echo "Could not find dispatched workflow run for ${workflow_file}"
+              exit 1
+            fi
+
+            echo "Found run id ${run_id} for ${workflow_file}"
+            gh run watch "${run_id}" \
+              --repo "${GH_REPO}" \
+              --exit-status
+          }
+
+          dispatch_and_wait() {
+            local workflow_file="$1"
+            shift
+
+            local started_at
+            started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+            echo
+            echo "Dispatching ${workflow_file}"
+
+            gh workflow run "${workflow_file}" \
+              --repo "${GH_REPO}" \
+              --ref "${WORKFLOW_REF}" \
+              "$@"
+
+            wait_for_workflow_run "${workflow_file}" "${started_at}"
+          }
+
+          dispatch_and_wait "fork-gpui.yaml" \
+            -f upstream_repo="${UPSTREAM_REPO}" \
+            -f upstream_branch="${UPSTREAM_BRANCH}" \
+            -f output_branch="${FORK_OUTPUT_BRANCH}" \
+            -f commit_message="Add gpui facade crate" \
+            -f force_push="${FORCE_PUSH}"
+
+          dispatch_and_wait "bind-gpui-component.yaml" \
+            -f zed_ref="${FORK_OUTPUT_BRANCH}" \
+            -f source_repo="${SOURCE_REPO}" \
+            -f source_ref="${SOURCE_REF}" \
+            -f target_branch="${BIND_TARGET_BRANCH}"
+
+          dispatch_and_wait "check-cargo-local-dependencies.yaml" \
+            -f ref="${BIND_TARGET_BRANCH}" \
+            -f fail_on_warnings="${FAIL_ON_WARNINGS}"
+
+      - name: Checkout generated gpui nightly branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BIND_TARGET_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Generate README.md from generated-source commit
+        id: readme
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CURRENT_HEAD="$(git rev-parse HEAD)"
+          PRE_README_COMMIT="${CURRENT_HEAD}"
+
+          # If the branch already has the separate README commit from a previous
+          # nightly run, keep using its parent as the dependency rev.
+          # This prevents a pointless new README commit on every nightly run
+          # when generated files are unchanged.
+          if git rev-parse HEAD^ >/dev/null 2>&1; then
+            LAST_SUBJECT="$(git log -1 --format=%s)"
+            CHANGED_FILES="$(git diff-tree --no-commit-id --name-only -r HEAD | sort | tr '\n' ' ')"
+
+            if [ "${LAST_SUBJECT}" = "Add generated nightly README" ] && [ "${CHANGED_FILES}" = "README.md " ]; then
+              PRE_README_COMMIT="$(git rev-parse HEAD^)"
+            fi
+          fi
+
+          echo "pre_readme_commit=${PRE_README_COMMIT}" >> "${GITHUB_OUTPUT}"
+
+          cat > README.md <<EOF
+          # gpui-binder nightly
+
+          This branch is generated automatically from:
+
+          - GPUI/Zed source: \`${UPSTREAM_REPO}\` at \`${UPSTREAM_BRANCH}\`
+          - gpui-component source: \`${SOURCE_REPO}\` at \`${SOURCE_REF}\`
+
+          The dependency revision below intentionally points to the generated source commit before this README commit:
+
+          \`\`\`toml
+          gpui = { git = "https://github.com/gpui-binder/gpui-binder", package = "gpui_facade", rev = "${PRE_README_COMMIT}", features = ["gpui_macos", "gpui_web", "gpui_macros", "font-kit", "x11", "wayland", "runtime_shaders"] }
+          gpui-component = { git = "https://github.com/gpui-binder/gpui-binder", package = "gpui-component", rev = "${PRE_README_COMMIT}" }
+          \`\`\`
+
+          Generated branches:
+
+          - \`${FORK_OUTPUT_BRANCH}\`: Zed/GPUI fork branch before importing gpui-component
+          - \`${BIND_TARGET_BRANCH}\`: final branch after importing gpui-component and passing Cargo local dependency checks
+          EOF
+
+          sed -i 's/^          //' README.md
+
+          git diff -- README.md
+
+      - name: Commit README.md separately
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git add README.md
+
+          if git diff --cached --quiet; then
+            echo "README.md is already up to date. No README commit needed."
+            exit 0
+          fi
+
+          git commit -m "Add generated nightly README"
+          git push origin "HEAD:${BIND_TARGET_BRANCH}"
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## GPUI nightly generation"
+            echo ""
+            echo "Executed in order:"
+            echo ""
+            echo "1. \`fork-gpui.yaml\` -> \`${FORK_OUTPUT_BRANCH}\`"
+            echo "2. \`bind-gpui-component.yaml\` -> \`${BIND_TARGET_BRANCH}\`"
+            echo "3. \`check-cargo-local-dependencies.yaml\` against \`${BIND_TARGET_BRANCH}\`"
+            echo "4. Generate and commit \`README.md\` separately, only after all checks pass"
+            echo ""
+            echo "Schedule: daily at 17:42 GMT+9 / 08:42 UTC"
+            echo ""
+            echo "Usage revision: \`${{ steps.readme.outputs.pre_readme_commit }}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"

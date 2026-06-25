@@ -1,0 +1,191 @@
+name: Run GPUI Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: "Repository Source of gpui (user/repo)"
+        required: true
+        default: "zed-industries/zed"
+        type: string
+
+      upstream_branch:
+        description: "Branch from gpui source repo"
+        required: true
+        default: "main"
+        type: string
+
+      source_repo:
+        description: "Repository Source of gpui-component (user/repo)"
+        required: true
+        default: "longbridge/gpui-component"
+        type: string
+
+      source_ref:
+        description: "Branch, tag, or SHA from gpui-component source repo"
+        required: true
+        default: "main"
+        type: string
+
+      fork_output_branch:
+        description: "Intermediate branch created by fork-gpui.yaml"
+        required: true
+        default: "generated-gpui-base"
+        type: string
+
+      bind_target_branch:
+        description: "Final branch created by bind-gpui-component.yaml"
+        required: true
+        default: "generated-gpui-binded"
+        type: string
+
+      force_push:
+        description: "Force push generated branches if they already exist"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: run-gpui-pipeline-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  pipeline:
+    name: Fork, bind, then check Cargo local dependencies
+    runs-on: ubuntu-latest
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      WORKFLOW_REF: ${{ github.ref_name }}
+
+    steps:
+      - name: Show pipeline inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Workflow ref: ${WORKFLOW_REF}"
+          echo "Repository: ${GH_REPO}"
+          echo "Upstream repo: ${{ inputs.upstream_repo }}"
+          echo "Upstream branch: ${{ inputs.upstream_branch }}"
+          echo "Fork output branch: ${{ inputs.fork_output_branch }}"
+          echo "gpui-component source repo: ${{ inputs.source_repo }}"
+          echo "gpui-component source ref: ${{ inputs.source_ref }}"
+          echo "Bind target branch: ${{ inputs.bind_target_branch }}"
+          echo "Force push: ${{ inputs.force_push }}"
+
+      - name: Run workflows sequentially
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          wait_for_workflow_run() {
+            local workflow_file="$1"
+            local started_at="$2"
+
+            echo "Waiting for workflow run to appear: ${workflow_file}"
+
+            local run_id=""
+
+            for i in $(seq 1 60); do
+              run_id="$(
+                gh run list \
+                  --repo "${GH_REPO}" \
+                  --workflow "${workflow_file}" \
+                  --branch "${WORKFLOW_REF}" \
+                  --event workflow_dispatch \
+                  --limit 30 \
+                  --json databaseId,createdAt,status \
+                | jq -r --arg started_at "${started_at}" '
+                    map(select(.createdAt >= $started_at))
+                    | sort_by(.createdAt)
+                    | reverse
+                    | .[0].databaseId // empty
+                  '
+              )"
+
+              if [ -n "${run_id}" ]; then
+                break
+              fi
+
+              sleep 5
+            done
+
+            if [ -z "${run_id}" ]; then
+              echo "Could not find dispatched workflow run for ${workflow_file}"
+              exit 1
+            fi
+
+            echo "Found run id ${run_id} for ${workflow_file}"
+            gh run watch "${run_id}" \
+              --repo "${GH_REPO}" \
+              --exit-status
+          }
+
+          dispatch_and_wait() {
+            local workflow_file="$1"
+            shift
+
+            local started_at
+            started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+            echo
+            echo "Dispatching ${workflow_file}"
+
+            gh workflow run "${workflow_file}" \
+              --repo "${GH_REPO}" \
+              --ref "${WORKFLOW_REF}" \
+              "$@"
+
+            wait_for_workflow_run "${workflow_file}" "${started_at}"
+          }
+
+          dispatch_and_wait "fork-gpui.yaml" \
+            -f upstream_repo="${{ inputs.upstream_repo }}" \
+            -f upstream_branch="${{ inputs.upstream_branch }}" \
+            -f output_branch="${{ inputs.fork_output_branch }}" \
+            -f commit_message="Add gpui facade crate" \
+            -f force_push="${{ inputs.force_push }}"
+
+          dispatch_and_wait "bind-gpui-component.yaml" \
+            -f zed_ref="${{ inputs.fork_output_branch }}" \
+            -f source_repo="${{ inputs.source_repo }}" \
+            -f source_ref="${{ inputs.source_ref }}" \
+            -f target_branch="${{ inputs.bind_target_branch }}"
+
+          dispatch_and_wait "check-cargo-local-dependencies.yaml" \
+            -f ref="${{ inputs.bind_target_branch }}"
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## GPUI pipeline"
+            echo ""
+            echo "Executed in order:"
+            echo ""
+            echo "1. \`fork-gpui.yaml\`"
+            echo "2. \`bind-gpui-component.yaml\`"
+            echo "3. \`check-cargo-local-dependencies.yaml\`"
+            echo ""
+            echo "Inputs:"
+            echo ""
+            echo "- Workflow ref: \`${WORKFLOW_REF}\`"
+            echo "- Upstream repo: \`${{ inputs.upstream_repo }}\`"
+            echo "- Upstream branch: \`${{ inputs.upstream_branch }}\`"
+            echo "- gpui-component source repo: \`${{ inputs.source_repo }}\`"
+            echo "- gpui-component source ref: \`${{ inputs.source_ref }}\`"
+            echo ""
+            echo "Branches:"
+            echo ""
+            echo "- Fork output branch: \`${{ inputs.fork_output_branch }}\`"
+            echo "- Final bind/check branch: \`${{ inputs.bind_target_branch }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,503 @@
+name: Check Cargo Local Dependencies
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag, or commit SHA to check"
+        required: true
+        default: "main"
+        type: string
+      scan_roots:
+        description: "Newline-separated directories to scan. Use . to scan the whole repo."
+        required: false
+        default: |
+          .
+        type: string
+      fail_on_warnings:
+        description: "Fail the workflow when non-fatal suspicious conditions are found"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  check-cargo-local-dependencies:
+    name: Check Cargo local dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout selected ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+
+      - name: Show checked ref
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "Requested ref: ${{ inputs.ref }}"
+          echo "Checked out commit: $(git rev-parse HEAD)"
+          echo
+          git status --short --branch
+
+      - name: Check Cargo local dependencies
+        shell: bash
+        env:
+          SCAN_ROOTS: ${{ inputs.scan_roots }}
+          FAIL_ON_WARNINGS: ${{ inputs.fail_on_warnings }}
+        run: |
+          set -Eeuo pipefail
+
+          python3 <<'PY'
+          from __future__ import annotations
+
+          import os
+          import sys
+          import tomllib
+          from dataclasses import dataclass
+          from pathlib import Path
+          from typing import Any, Iterable
+
+          ROOT = Path.cwd().resolve()
+          ROOT_CARGO = ROOT / "Cargo.toml"
+
+          FAIL_ON_WARNINGS = os.environ.get("FAIL_ON_WARNINGS", "false").lower() == "true"
+
+          DEFAULT_SKIP_DIR_NAMES = {
+              ".git",
+              ".github",
+              ".idea",
+              ".vscode",
+              ".zed",
+              "target",
+              "node_modules",
+              "vendor",
+              ".cargo",
+              ".cache",
+              ".next",
+              "dist",
+              "build",
+              "out",
+          }
+
+          errors: list[str] = []
+          warnings: list[str] = []
+
+
+          @dataclass(frozen=True)
+          class LocalDependency:
+              owner_manifest: Path
+              table_name: str
+              dep_name: str
+              raw_path: str
+              base_dir: Path
+              source: str
+
+              @property
+              def reason(self) -> str:
+                  return f"{self.table_name}.{self.dep_name} {self.source}"
+
+
+          def rel(path: Path) -> str:
+              try:
+                  return str(path.resolve().relative_to(ROOT))
+              except ValueError:
+                  return str(path)
+
+
+          def fail(message: str) -> None:
+              errors.append(message)
+
+
+          def warn(message: str) -> None:
+              warnings.append(message)
+
+
+          def is_under_repo(path: Path) -> bool:
+              try:
+                  path.resolve().relative_to(ROOT)
+                  return True
+              except ValueError:
+                  return False
+
+
+          def load_toml(path: Path) -> dict[str, Any] | None:
+              try:
+                  with path.open("rb") as f:
+                      return tomllib.load(f)
+              except Exception as exc:
+                  fail(f"cannot parse {rel(path)}: {exc}")
+                  return None
+
+
+          def should_skip_dir(path: Path) -> bool:
+              name = path.name
+
+              if name in DEFAULT_SKIP_DIR_NAMES:
+                  return True
+
+              # Skip hidden tool/cache directories by default, but keep normal source dirs.
+              if name.startswith(".") and name not in {".config"}:
+                  return True
+
+              return False
+
+
+          def parse_scan_roots() -> list[Path]:
+              raw = os.environ.get("SCAN_ROOTS", "").strip()
+              if not raw:
+                  raw = "."
+
+              roots: list[Path] = []
+
+              for line in raw.splitlines():
+                  item = line.strip()
+                  if not item:
+                      continue
+
+                  path = (ROOT / item).resolve()
+
+                  if not is_under_repo(path):
+                      fail(f"scan root points outside repo: {item}")
+                      continue
+
+                  if not path.exists():
+                      warn(f"scan root does not exist, skipping: {item}")
+                      continue
+
+                  roots.append(path)
+
+              if not roots:
+                  fail("no valid scan roots were provided")
+
+              return roots
+
+
+          def find_manifests_under(scan_root: Path) -> Iterable[Path]:
+              if scan_root.is_file():
+                  if scan_root.name == "Cargo.toml":
+                      yield scan_root.resolve()
+                  return
+
+              for dirpath, dirnames, filenames in os.walk(scan_root):
+                  current = Path(dirpath)
+
+                  dirnames[:] = [
+                      name
+                      for name in dirnames
+                      if not should_skip_dir(current / name)
+                  ]
+
+                  if "Cargo.toml" in filenames:
+                      yield (current / "Cargo.toml").resolve()
+
+
+          def dependency_tables(manifest: dict[str, Any]) -> Iterable[tuple[str, dict[str, Any]]]:
+              # Standard dependency tables.
+              for key in ("dependencies", "dev-dependencies", "build-dependencies"):
+                  table = manifest.get(key)
+                  if isinstance(table, dict):
+                      yield key, table
+
+              # Target-specific dependency tables.
+              target = manifest.get("target")
+              if isinstance(target, dict):
+                  for target_name, target_table in target.items():
+                      if not isinstance(target_table, dict):
+                          continue
+
+                      for key in ("dependencies", "dev-dependencies", "build-dependencies"):
+                          table = target_table.get(key)
+                          if isinstance(table, dict):
+                              yield f"target.{target_name}.{key}", table
+
+              # Local patch overrides.
+              #
+              # Example:
+              # [patch.crates-io]
+              # foo = { path = "crates/foo" }
+              patch = manifest.get("patch")
+              if isinstance(patch, dict):
+                  for patch_name, patch_table in patch.items():
+                      if isinstance(patch_table, dict):
+                          yield f"patch.{patch_name}", patch_table
+
+              # Deprecated but still supported by Cargo.
+              #
+              # Example:
+              # [replace]
+              # "foo:0.1.0" = { path = "crates/foo" }
+              replace = manifest.get("replace")
+              if isinstance(replace, dict):
+                  yield "replace", replace
+
+
+          def collect_workspace_dependencies(root_manifest: dict[str, Any] | None) -> dict[str, Any]:
+              if root_manifest is None:
+                  return {}
+
+              workspace = root_manifest.get("workspace")
+              if not isinstance(workspace, dict):
+                  return {}
+
+              deps = workspace.get("dependencies")
+              if not isinstance(deps, dict):
+                  return {}
+
+              return deps
+
+
+          def discover_package_names(manifests: Iterable[Path]) -> dict[str, list[Path]]:
+              package_names: dict[str, list[Path]] = {}
+
+              for manifest_path in manifests:
+                  manifest = load_toml(manifest_path)
+                  if manifest is None:
+                      continue
+
+                  package = manifest.get("package")
+                  if not isinstance(package, dict):
+                      continue
+
+                  name = package.get("name")
+                  if not isinstance(name, str):
+                      continue
+
+                  package_names.setdefault(name, []).append(manifest_path)
+
+              return package_names
+
+
+          def explicit_local_dependencies(manifest_path: Path, manifest: dict[str, Any]) -> Iterable[LocalDependency]:
+              manifest_dir = manifest_path.parent
+
+              for table_name, table in dependency_tables(manifest):
+                  for dep_name, dep_value in table.items():
+                      if not isinstance(dep_name, str):
+                          continue
+
+                      if not isinstance(dep_value, dict):
+                          continue
+
+                      raw_path = dep_value.get("path")
+                      if isinstance(raw_path, str):
+                          yield LocalDependency(
+                              owner_manifest=manifest_path,
+                              table_name=table_name,
+                              dep_name=dep_name,
+                              raw_path=raw_path,
+                              base_dir=manifest_dir,
+                              source="path dependency",
+                          )
+
+
+          def workspace_local_dependencies(
+              manifest_path: Path,
+              manifest: dict[str, Any],
+              workspace_deps: dict[str, Any],
+              discovered_package_names: dict[str, list[Path]],
+          ) -> Iterable[LocalDependency]:
+              # We do not trust root [workspace].members or [workspace].exclude.
+              #
+              # But Cargo's `workspace = true` dependency resolution requires
+              # root [workspace.dependencies]. So we use only that table as a
+              # dependency-resolution table.
+              for table_name, table in dependency_tables(manifest):
+                  # [patch] and [replace] do not use workspace=true.
+                  if table_name.startswith("patch.") or table_name == "replace":
+                      continue
+
+                  for dep_name, dep_value in table.items():
+                      if not isinstance(dep_name, str):
+                          continue
+
+                      if not isinstance(dep_value, dict):
+                          continue
+
+                      if dep_value.get("workspace") is not True:
+                          continue
+
+                      root_dep = workspace_deps.get(dep_name)
+
+                      if isinstance(root_dep, dict):
+                          root_path = root_dep.get("path")
+
+                          if isinstance(root_path, str):
+                              yield LocalDependency(
+                                  owner_manifest=manifest_path,
+                                  table_name=table_name,
+                                  dep_name=dep_name,
+                                  raw_path=root_path,
+                                  base_dir=ROOT,
+                                  source="workspace local path dependency",
+                              )
+                          else:
+                              # External workspace dependency, e.g. anyhow.workspace.
+                              pass
+
+                      elif dep_name in discovered_package_names:
+                          # A package with this name exists locally, but root does
+                          # not map it through [workspace.dependencies].
+                          #
+                          # This is suspicious, but not necessarily a missing-file
+                          # problem.
+                          warn(
+                              f"{rel(manifest_path)}: {table_name}.{dep_name} uses workspace=true; "
+                              f"a local package named {dep_name!r} exists, but root "
+                              f"[workspace.dependencies] does not provide a path for it"
+                          )
+
+                      else:
+                          # Could be an external workspace dependency that root
+                          # failed to define, or a missing local crate. Since we
+                          # are not trusting workspace membership, keep this as a
+                          # warning unless fail_on_warnings is true.
+                          warn(
+                              f"{rel(manifest_path)}: {table_name}.{dep_name} uses workspace=true, "
+                              f"but root [workspace.dependencies] does not define it and "
+                              f"no local package named {dep_name!r} was discovered"
+                          )
+
+
+          def check_local_dependency(dep: LocalDependency) -> None:
+              dep_dir = (dep.base_dir / dep.raw_path).resolve()
+              dep_manifest = dep_dir / "Cargo.toml"
+
+              if not is_under_repo(dep_dir):
+                  fail(
+                      f"{rel(dep.owner_manifest)}: {dep.reason} points outside repo: "
+                      f"{dep.raw_path}"
+                  )
+                  return
+
+              if not dep_dir.exists():
+                  fail(
+                      f"{rel(dep.owner_manifest)}: {dep.reason} missing directory: "
+                      f"{dep.raw_path} -> {rel(dep_dir)}"
+                  )
+                  return
+
+              if not dep_dir.is_dir():
+                  fail(
+                      f"{rel(dep.owner_manifest)}: {dep.reason} is not a directory: "
+                      f"{dep.raw_path} -> {rel(dep_dir)}"
+                  )
+                  return
+
+              if not dep_manifest.exists():
+                  fail(
+                      f"{rel(dep.owner_manifest)}: {dep.reason} missing Cargo.toml: "
+                      f"{dep.raw_path} -> {rel(dep_manifest)}"
+                  )
+                  return
+
+
+          def main() -> int:
+              scan_roots = parse_scan_roots()
+
+              manifests: set[Path] = set()
+
+              for scan_root in scan_roots:
+                  for manifest_path in find_manifests_under(scan_root):
+                      if is_under_repo(manifest_path):
+                          manifests.add(manifest_path)
+                      else:
+                          fail(f"discovered manifest outside repo: {manifest_path}")
+
+              root_manifest: dict[str, Any] | None = None
+
+              if ROOT_CARGO.exists():
+                  # Include root Cargo.toml so root [patch], [replace], and
+                  # [workspace.dependencies] local paths are checked.
+                  #
+                  # Important:
+                  # Do NOT use root [workspace].members.
+                  # Do NOT use root [workspace].exclude.
+                  # The root workspace membership list is intentionally not trusted.
+                  manifests.add(ROOT_CARGO.resolve())
+                  root_manifest = load_toml(ROOT_CARGO)
+              else:
+                  warn("root Cargo.toml is missing; workspace=true dependencies cannot be resolved")
+
+              manifests = set(sorted(manifests))
+
+              if not manifests:
+                  fail("no Cargo.toml files were discovered")
+
+              workspace_deps = collect_workspace_dependencies(root_manifest)
+              discovered_package_names = discover_package_names(manifests)
+
+              checked_dependencies = 0
+
+              for manifest_path in sorted(manifests):
+                  manifest = load_toml(manifest_path)
+                  if manifest is None:
+                      continue
+
+                  for dep in explicit_local_dependencies(manifest_path, manifest):
+                      checked_dependencies += 1
+                      check_local_dependency(dep)
+
+                  for dep in workspace_local_dependencies(
+                      manifest_path=manifest_path,
+                      manifest=manifest,
+                      workspace_deps=workspace_deps,
+                      discovered_package_names=discovered_package_names,
+                  ):
+                      checked_dependencies += 1
+                      check_local_dependency(dep)
+
+              print("Cargo local dependency check")
+              print("============================")
+              print()
+              print(f"Repository root: {ROOT}")
+              print(f"Fail on warnings: {FAIL_ON_WARNINGS}")
+              print()
+              print("Scan roots:")
+              for scan_root in scan_roots:
+                  print(f"  - {rel(scan_root)}")
+              print()
+              print(f"Discovered Cargo.toml files: {len(manifests)}")
+              print(f"Discovered package names: {len(discovered_package_names)}")
+              print(f"Checked local dependency edges: {checked_dependencies}")
+              print()
+
+              print("Discovered manifests:")
+              for manifest_path in sorted(manifests):
+                  print(f"  - {rel(manifest_path)}")
+
+              if warnings:
+                  print()
+                  print("Warnings:")
+                  for message in warnings:
+                      print(f"  - {message}")
+
+              if errors:
+                  print()
+                  print("Errors:")
+                  for message in errors:
+                      print(f"  - {message}")
+
+              if warnings and FAIL_ON_WARNINGS:
+                  print()
+                  print("FAILED: warnings were found and fail_on_warnings=true")
+                  return 1
+
+              if errors:
+                  print()
+                  print("FAILED: missing or invalid local Cargo dependencies were found")
+                  return 1
+
+              print()
+              print("PASS: all discovered local Cargo dependency paths exist.")
+              return 0
+
+
+          raise SystemExit(main())
+          PY
