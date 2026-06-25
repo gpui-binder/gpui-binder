@@ -627,22 +627,46 @@ jobs:
           set -euo pipefail
 
           TARGET_BRANCH="${{ inputs.target_branch }}"
-          REMOTE_BRANCH_EXISTS=false
+          REMOTE_GENERATED_BRANCH="__remote_generated_tree_for_compare"
 
           if git ls-remote --exit-code --heads origin "$TARGET_BRANCH" >/dev/null 2>&1; then
-            REMOTE_BRANCH_EXISTS=true
             git fetch --no-tags origin "$TARGET_BRANCH:refs/remotes/origin/$TARGET_BRANCH"
-          fi
 
-          if [ "$REMOTE_BRANCH_EXISTS" = "true" ]; then
-            # generated-gpui-nightly may already have README.md committed separately.
-            # Compare generated source files without README.md; otherwise an existing
-            # README-only commit would make every nightly run look different.
-            if git diff --quiet "origin/$TARGET_BRANCH" HEAD -- . ':(exclude)README.md'; then
+            # Normalize the existing remote branch into a temporary local branch.
+            # If the remote branch ends with the nightly README-only commit,
+            # move the temporary branch back one commit so it points at the
+            # previous generated source tree.
+            git branch -f "$REMOTE_GENERATED_BRANCH" "refs/remotes/origin/$TARGET_BRANCH"
+
+            if git rev-parse "$REMOTE_GENERATED_BRANCH^" >/dev/null 2>&1; then
+              LAST_SUBJECT="$(git log -1 --format=%s "$REMOTE_GENERATED_BRANCH")"
+              CHANGED_FILES="$(
+                git diff-tree \
+                  --no-commit-id \
+                  --name-only \
+                  -r "$REMOTE_GENERATED_BRANCH" \
+                | sort \
+                | tr '\n' ' '
+              )"
+
+              if [ "$LAST_SUBJECT" = "Add generated nightly README" ] && [ "$CHANGED_FILES" = "README.md " ]; then
+                echo "Remote branch ends with README-only commit."
+                git branch -f "$REMOTE_GENERATED_BRANCH" "$REMOTE_GENERATED_BRANCH^"
+              fi
+            fi
+
+            echo "Comparing remote generated tree with new generated tree..."
+            echo "Remote generated tree: $(git rev-parse "$REMOTE_GENERATED_BRANCH")"
+            echo "New generated tree: $(git rev-parse HEAD)"
+
+            if git diff --quiet "$REMOTE_GENERATED_BRANCH" HEAD -- .; then
               echo "Remote branch '$TARGET_BRANCH' already has the same generated files."
               echo "Skipping push to avoid changing the branch commit unnecessarily."
               exit 0
             fi
+
+            echo "Generated files changed. Files differing from previous generated commit:"
+            git diff --name-status "$REMOTE_GENERATED_BRANCH" HEAD -- . | head -200
           fi
 
           git push --force-with-lease origin "HEAD:$TARGET_BRANCH"
