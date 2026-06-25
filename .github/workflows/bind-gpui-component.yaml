@@ -549,21 +549,54 @@ jobs:
 
           crates = json.loads(os.environ["CRATES_JSON"])
           imported_packages = set(crates.keys())
+          imported_targets = {
+              name: Path(item["target"])
+              for name, item in crates.items()
+          }
 
-          def rewrite_inline_table(dep_name: str, body: str) -> str:
+          def extract_inline_value(body: str, key: str):
+              if key == "features":
+                  match = re.search(r'features\s*=\s*\[([^\]]*)\]', body, re.S)
+                  return "[" + match.group(1).strip() + "]" if match else None
+              match = re.search(rf'{re.escape(key)}\s*=\s*("[^"]*"|true|false)', body)
+              return match.group(1) if match else None
+
+          def rewrite_inline_table(cargo_toml: Path, dep_name: str, body: str) -> str:
+              package_value = extract_inline_value(body, "package")
+              package_name = package_value.strip('"') if package_value else dep_name
+
               keep = []
-              package_match = re.search(r'package\s*=\s*"([^"]+)"', body)
-              if package_match:
-                  keep.append(f'package = "{package_match.group(1)}"')
+              if package_value:
+                  keep.append(f'package = {package_value}')
 
-              features_match = re.search(r'features\s*=\s*\[([^\]]*)\]', body, re.S)
-              if features_match:
-                  keep.append("features = [" + features_match.group(1).strip() + "]")
+              features_value = extract_inline_value(body, "features")
+              if features_value:
+                  keep.append(f"features = {features_value}")
 
-              for key in ("default-features", "optional"):
-                  match = re.search(rf'{key}\s*=\s*(true|false)', body)
-                  if match:
-                      keep.append(f"{key} = {match.group(1)}")
+              default_features_value = extract_inline_value(body, "default-features")
+              optional_value = extract_inline_value(body, "optional")
+
+              # Cargo does not allow member crates to inherit a workspace dependency
+              # and override default-features there. Preserve the original per-crate
+              # behavior by keeping those dependencies as explicit local path deps.
+              if default_features_value is not None:
+                  target = imported_targets.get(package_name)
+                  if target is None:
+                      target = imported_targets.get(dep_name)
+                  if target is None:
+                      raise SystemExit(
+                          f"Cannot resolve imported dependency target for {dep_name} / {package_name} in {cargo_toml}"
+                      )
+                  relative_path = os.path.relpath(target, cargo_toml.parent).replace(os.sep, "/")
+                  parts = [f'path = "{relative_path}"'] + keep + [
+                      f"default-features = {default_features_value}"
+                  ]
+                  if optional_value is not None:
+                      parts.append(f"optional = {optional_value}")
+                  return f'{dep_name} = {{ ' + ", ".join(parts) + " }"
+
+              if optional_value is not None:
+                  keep.append(f"optional = {optional_value}")
 
               parts = ["workspace = true"] + keep
               return f'{dep_name} = {{ ' + ", ".join(parts) + " }"
@@ -579,7 +612,7 @@ jobs:
               )
 
               def repl(match):
-                  return rewrite_inline_table(crate_name, match.group(1))
+                  return rewrite_inline_table(cargo_toml, crate_name, match.group(1))
 
               text = re.sub(
                   rf'(?ms)^\s*{re.escape(crate_name)}\s*=\s*\{{([^\n]*)\}}\s*$',
