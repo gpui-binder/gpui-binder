@@ -682,7 +682,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           cargo metadata --no-deps
+          cargo check --workspace --all-targets
 
       - name: Commit generated branch
         id: generated_commit
