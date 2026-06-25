@@ -313,24 +313,37 @@ jobs:
 
           source_root = Path("_gpui_component_source")
 
-          # gpui-component currently uses include_str!("../../../../themes/...")
-          # from crates/gpui_component/src/theme, which resolves to repo-root/themes.
-          # The package graph import copies only Cargo packages, so copy this
-          # non-package support directory explicitly.
-          support_dirs = ["themes"]
+          # The package graph import copies only Cargo packages. gpui-component
+          # also references repo-root support files through compile-time
+          # include_str! paths, for example:
+          #   crates/gpui_component/src/theme -> ../../../../themes/...
+          #   crates/gpui_component_story/src/stories -> ../../../../README.md
+          # Copy those non-package support paths explicitly so the generated
+          # repository layout matches the source repository where the macros
+          # and examples were authored.
+          support_paths = [
+              "themes",
+              "README.md",
+          ]
 
-          for rel in support_dirs:
+          for rel in support_paths:
               source = source_root / rel
               target = Path(rel)
               if not source.exists():
                   print(f"Source support path not found, skipping: {source}")
                   continue
 
-              if target.exists():
-                  shutil.rmtree(target)
-
-              shutil.copytree(source, target, ignore=shutil.ignore_patterns(".git", "target", ".DS_Store", "__MACOSX", "Thumbs.db", "desktop.ini", ".claude", ".codex", "AGENTS.md", "CLAUDE.md", "GEMINI.md"))
-              print(f"Imported source support directory {source} -> {target}")
+              if source.is_dir():
+                  if target.exists():
+                      shutil.rmtree(target)
+                  shutil.copytree(source, target, ignore=shutil.ignore_patterns(".git", "target", ".DS_Store", "__MACOSX", "__MACOSX", "Thumbs.db", "desktop.ini", ".claude", ".codex", "AGENTS.md", "CLAUDE.md", "GEMINI.md"))
+                  print(f"Imported source support directory {source} -> {target}")
+              else:
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  if target.exists() and target.is_dir():
+                      shutil.rmtree(target)
+                  shutil.copy2(source, target)
+                  print(f"Imported source support file {source} -> {target}")
 
       - name: Patch root workspace Cargo.toml
         env:
