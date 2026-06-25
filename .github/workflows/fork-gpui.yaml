@@ -33,6 +33,12 @@ on:
         default: false
         type: boolean
 
+      debug_logs:
+        description: "Print verbose debug logs"
+        required: false
+        default: false
+        type: boolean
+
 permissions:
   contents: write
 
@@ -485,6 +491,8 @@ jobs:
       OUTPUT_BRANCH_INPUT: ${{ inputs.output_branch }}
       COMMIT_MESSAGE_INPUT: ${{ inputs.commit_message }}
       FORCE_PUSH_INPUT: ${{ inputs.force_push }}
+      DEBUG_LOGS_INPUT: ${{ inputs.debug_logs }}
+      CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target
       RUN_NUMBER_VALUE: ${{ github.run_number }}
       TARGET_REPOSITORY: ${{ github.repository }}
       PUSH_TOKEN: ${{ github.token }}
@@ -496,7 +504,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get install -y --no-install-recommends \
             pkg-config \
             libfontconfig1-dev \
             libxkbcommon-dev \
@@ -507,6 +515,19 @@ jobs:
             libxcb-shape0-dev \
             libxcb-xfixes0-dev \
             libssl-dev
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ runner.temp }}/cargo-target
+          key: cargo-${{ runner.os }}-${{ inputs.upstream_repo }}-${{ inputs.upstream_branch }}-fork-gpui-perf-v1
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ inputs.upstream_repo }}-${{ inputs.upstream_branch }}-
+            cargo-${{ runner.os }}-${{ inputs.upstream_repo }}-
+            cargo-${{ runner.os }}-
 
       - name: Sparse clone upstream, validate, and create generated branch
         shell: bash
@@ -531,13 +552,13 @@ jobs:
           echo "Upstream branch: ${UPSTREAM_BRANCH}"
           echo "Output branch: ${OUTPUT_BRANCH}"
 
-          SOURCE_DIR="$RUNNER_TEMP/source"
           OUT_DIR="$RUNNER_TEMP/out"
+          SOURCE_DIR="$OUT_DIR"
 
-          rm -rf "$SOURCE_DIR" "$OUT_DIR"
-          mkdir -p "$SOURCE_DIR" "$OUT_DIR"
+          rm -rf "$OUT_DIR"
+          mkdir -p "$OUT_DIR"
 
-          cd "$SOURCE_DIR"
+          cd "$OUT_DIR"
 
           git init
           git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
@@ -567,23 +588,23 @@ jobs:
             fi
           done
 
-          # Force-include files needed by the generator and metadata check.
+          # Force-include only files needed by the generator and metadata check.
+          # Do not force-include /crates/** here; that defeats crate exclusions and
+          # causes Git to materialize files that are deleted again later.
           {
             echo "/Cargo.toml"
             echo "/Cargo.lock"
             echo "/rust-toolchain.toml"
             echo "/rustfmt.toml"
-            echo "/crates/"
-            echo "/crates/**"
             echo "/crates/gpui/"
             echo "/crates/gpui/**"
             echo "/crates/gpui/Cargo.toml"
-            echo "/crates/gpui_facade/"
-            echo "/crates/gpui_facade/**"
           } >> "$SPARSE_FILE"
 
-          echo "Sparse checkout rules:"
-          cat "$SPARSE_FILE"
+          if [ "${DEBUG_LOGS_INPUT}" = "true" ]; then
+            echo "Sparse checkout rules:"
+            cat "$SPARSE_FILE"
+          fi
 
           git fetch \
             --filter=blob:none \
@@ -592,8 +613,10 @@ jobs:
 
           git checkout --detach FETCH_HEAD
 
-          echo "Sparse source checkout root:"
-          find . -maxdepth 2 -mindepth 1 -not -path './.git*' | sort | head -200
+          if [ "${DEBUG_LOGS_INPUT}" = "true" ]; then
+            echo "Sparse source checkout root:"
+            find . -maxdepth 2 -mindepth 1 -not -path './.git*' | sort | head -200
+          fi
 
           capture_gpui_package_metadata() {
             local metadata_file="$RUNNER_TEMP/gpui-package-metadata.toml"
@@ -639,35 +662,7 @@ jobs:
           }
 
           copy_sparse_source_to_output() {
-            echo "Copying sparse source checkout into output directory"
-
-            cd "$SOURCE_DIR"
-
-            local rsync_excludes="$RUNNER_TEMP/rsync-excludes"
-            : > "$rsync_excludes"
-
-            printf '%s\n' "${EXCLUDE_PATTERNS}" | while IFS= read -r pattern; do
-              pattern="${pattern%$'\r'}"
-
-              case "$pattern" in
-                "" ) continue ;;
-                \#* ) continue ;;
-                \!* ) continue ;;
-              esac
-
-              printf '%s\n' "$pattern" >> "$rsync_excludes"
-            done
-
-            printf '%s\n' ".git/" >> "$rsync_excludes"
-
-            rsync -a \
-              --delete \
-              --exclude-from="$rsync_excludes" \
-              "$SOURCE_DIR"/ \
-              "$OUT_DIR"/
-
-            echo "Output tree after source copy:"
-            find "$OUT_DIR" -maxdepth 2 -mindepth 1 | sed "s#^$OUT_DIR/##" | sort | head -200
+            echo "Using sparse checkout directly as output directory"
           }
 
           remove_materialized_exclusions() {
@@ -799,27 +794,52 @@ jobs:
                   return None
               return rel
 
-          def source_last_change_date(source_rel: str) -> str | None:
+          def load_latest_source_dates() -> dict[str, str]:
+              # One newest-to-oldest git log pass is behavior-equivalent to running
+              # `git log -1 --format=%cI -- <file>` for each file, but avoids thousands
+              # of subprocess calls on large source trees.
               result = subprocess.run(
                   [
                       "git",
                       "-C",
                       str(source_root),
                       "log",
-                      "-1",
-                      "--format=%cI",
-                      "--",
-                      source_rel,
+                      "--format=@@%cI",
+                      "--name-only",
                   ],
                   text=True,
                   stdout=subprocess.PIPE,
                   stderr=subprocess.PIPE,
-                  check=False,
+                  check=True,
               )
-              stamp = result.stdout.strip()
-              if not stamp:
-                  return None
-              return datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone(denver).date().isoformat()
+
+              latest: dict[str, str] = {}
+              current_date: str | None = None
+
+              for raw_line in result.stdout.splitlines():
+                  line = raw_line.strip()
+
+                  if not line:
+                      continue
+
+                  if line.startswith("@@"):
+                      stamp = line[2:]
+                      current_date = datetime.fromisoformat(
+                          stamp.replace("Z", "+00:00")
+                      ).astimezone(denver).date().isoformat()
+                      continue
+
+                  if current_date is None:
+                      continue
+
+                  latest.setdefault(line, current_date)
+
+              return latest
+
+          latest_source_dates = load_latest_source_dates()
+
+          def source_last_change_date(source_rel: str) -> str | None:
+              return latest_source_dates.get(source_rel)
 
           def filesystem_date(path: Path) -> str:
               return datetime.fromtimestamp(path.stat().st_mtime, denver).date().isoformat()
@@ -1228,8 +1248,10 @@ jobs:
             echo "Checking every workspace package with cargo check --workspace --all-targets"
             cargo check --workspace --all-targets
 
-            echo "Per-package manifest validation list:"
-            cat "$RUNNER_TEMP/workspace-package-manifests.tsv"
+            if [ "${DEBUG_LOGS_INPUT}" = "true" ]; then
+              echo "Per-package manifest validation list:"
+              cat "$RUNNER_TEMP/workspace-package-manifests.tsv"
+            fi
 
             echo "All workspace package metadata and cargo check validation passed"
           }
@@ -1256,20 +1278,25 @@ jobs:
 
           generate_files_by_date_markdown
 
-          echo "Final output tree root:"
-          find "$OUT_DIR" -maxdepth 2 -mindepth 1 | sed "s#^$OUT_DIR/##" | sort | head -200
+          if [ "${DEBUG_LOGS_INPUT}" = "true" ]; then
+            echo "Final output tree root:"
+            find "$OUT_DIR" -maxdepth 2 -mindepth 1 | sed "s#^$OUT_DIR/##" | sort | head -200
+          fi
 
           validate_cargo_metadata
 
           cd "$OUT_DIR"
 
+          rm -rf .git
           git init
           git checkout -B "$OUTPUT_BRANCH"
 
           git add -A
 
-          echo "Staged files summary:"
-          git status --short
+          if [ "${DEBUG_LOGS_INPUT}" = "true" ]; then
+            echo "Staged files summary:"
+            git status --short
+          fi
 
           if git diff --cached --quiet; then
             echo "No changes to commit."
