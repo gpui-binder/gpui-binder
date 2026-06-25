@@ -490,6 +490,24 @@ jobs:
       PUSH_TOKEN: ${{ github.token }}
 
     steps:
+      - name: Install Linux cargo dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libfontconfig1-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libssl-dev
+
       - name: Sparse clone upstream, validate, and create generated branch
         shell: bash
         run: |
