@@ -66,6 +66,7 @@ concurrency:
 jobs:
   nightly:
     name: Generate zed/gpui nightly branches
+    if: ${{ github.event_name != 'schedule' || github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
 
     env:

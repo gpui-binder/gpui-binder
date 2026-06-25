@@ -31,6 +31,7 @@ concurrency:
 jobs:
   delete-runs:
     name: Delete old workflow runs
+    if: ${{ github.event_name != 'schedule' || github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
