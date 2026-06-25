@@ -492,7 +492,7 @@ jobs:
       COMMIT_MESSAGE_INPUT: ${{ inputs.commit_message }}
       FORCE_PUSH_INPUT: ${{ inputs.force_push }}
       DEBUG_LOGS_INPUT: ${{ inputs.debug_logs }}
-      CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target
+      CARGO_TARGET_DIR: /tmp/cargo-target
       RUN_NUMBER_VALUE: ${{ github.run_number }}
       TARGET_REPOSITORY: ${{ github.repository }}
       PUSH_TOKEN: ${{ github.token }}
@@ -522,7 +522,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            ${{ runner.temp }}/cargo-target
+            /tmp/cargo-target
           key: cargo-${{ runner.os }}-${{ inputs.upstream_repo }}-${{ inputs.upstream_branch }}-fork-gpui-perf-v1
           restore-keys: |
             cargo-${{ runner.os }}-${{ inputs.upstream_repo }}-${{ inputs.upstream_branch }}-
