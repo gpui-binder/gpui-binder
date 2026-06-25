@@ -421,7 +421,7 @@ env:
     let _ = gpui::gpui_web::WebPlatform::new(true);
     ```
 
-  FILE__CRATES_GPUI_FACADE_SRC_MAIN_RS: |
+  FILE__CRATES_GPUI_FACADE_SRC_LIB_RS: |
     #![doc = "Facade crate that re-exports GPUI plus optional GPUI-related crates."]
 
     pub use gpui::*;
@@ -781,7 +781,7 @@ jobs:
               "README-zed.md",
               "crates/gpui_facade/Cargo.toml",
               "crates/gpui_facade/README.md",
-              "crates/gpui_facade/src/main.rs",
+              "crates/gpui_facade/src/lib.rs",
           }
 
           generated_or_rewritten = {
@@ -789,7 +789,7 @@ jobs:
               "Cargo.lock",
               "crates/gpui_facade/Cargo.toml",
               "crates/gpui_facade/README.md",
-              "crates/gpui_facade/src/main.rs",
+              "crates/gpui_facade/src/lib.rs",
           }
 
           def output_to_source_path(rel: str) -> str | None:
@@ -1249,8 +1249,8 @@ jobs:
             "FILE__CRATES_GPUI_FACADE_README_MD"
 
           write_embedded_file \
-            "crates/gpui_facade/src/main.rs" \
-            "FILE__CRATES_GPUI_FACADE_SRC_MAIN_RS"
+            "crates/gpui_facade/src/lib.rs" \
+            "FILE__CRATES_GPUI_FACADE_SRC_LIB_RS"
 
           amend_root_cargo_toml_for_workspace
 
