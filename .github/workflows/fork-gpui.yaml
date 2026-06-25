@@ -62,7 +62,14 @@ env:
     .cloudflare/
     extensions/workflows/
     script/**
-    assets/**
+    assets/badge/**
+    assets/icons/**
+    assets/images/**
+    assets/keymaps/**
+    assets/prompts/**
+    assets/settings/**
+    assets/sounds/**
+    assets/themes/**
     extensions/glsl/
     extensions/html/
     extensions/proto/
@@ -599,6 +606,11 @@ jobs:
             echo "/crates/gpui/"
             echo "/crates/gpui/**"
             echo "/crates/gpui/Cargo.toml"
+            # gpui_wgpu benches include font files via include_bytes! when
+            # cargo check --workspace --all-targets compiles bench targets.
+            # Keep this narrow: re-include only fonts, not all assets/**.
+            echo "/assets/fonts/"
+            echo "/assets/fonts/**"
           } >> "$SPARSE_FILE"
 
           if [ "${DEBUG_LOGS_INPUT}" = "true" ]; then
