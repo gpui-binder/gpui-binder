@@ -682,7 +682,7 @@ jobs:
           capture_upstream_file_dates_from_git() {
             local snapshot_path="$RUNNER_TEMP/upstream-file-dates.tsv"
 
-            echo "Capturing upstream file dates from Git commit history"
+            echo "Capturing upstream file dates from Git commit history" >&2
 
             cd "$OUT_DIR"
 
@@ -1330,6 +1330,10 @@ jobs:
           copy_sparse_source_to_output
 
           UPSTREAM_DATE_SNAPSHOT="$(capture_upstream_file_dates_from_git)"
+          if [ ! -f "$UPSTREAM_DATE_SNAPSHOT" ]; then
+            echo "Date snapshot was not created correctly: $UPSTREAM_DATE_SNAPSHOT" >&2
+            exit 1
+          fi
 
           remove_materialized_exclusions "$OUT_DIR"
 
