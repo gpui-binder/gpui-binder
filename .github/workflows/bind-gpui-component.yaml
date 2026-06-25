@@ -661,31 +661,67 @@ jobs:
           import re
 
           crates = json.loads(os.environ["CRATES_JSON"])
-          replacement = 'gpui = { package = "gpui_facade", path = "../gpui_facade", features = ["gpui_macos", "gpui_web", "gpui_macros", "font-kit", "x11", "wayland", "runtime_shaders"] }'
+          normal_replacement = 'gpui = { package = "gpui_facade", path = "../gpui_facade", features = ["gpui_macos", "gpui_web", "gpui_macros", "font-kit", "x11", "wayland", "runtime_shaders"] }'
+          test_replacement = 'gpui = { package = "gpui_facade", path = "../gpui_facade", features = ["gpui_macos", "gpui_web", "gpui_macros", "font-kit", "x11", "wayland", "runtime_shaders", "test-support"] }'
+
+          def section_bounds(text: str, section_name: str):
+              header = re.search(rf'(?m)^\[{re.escape(section_name)}\]\s*$', text)
+              if not header:
+                  return None
+              next_header = re.search(r'(?m)^\[', text[header.end():])
+              end = header.end() + next_header.start() if next_header else len(text)
+              return header.start(), header.end(), end
+
+          def remove_key_from_section(text: str, section_name: str, key: str) -> str:
+              bounds = section_bounds(text, section_name)
+              if not bounds:
+                  return text
+              section_start, header_end, section_end = bounds
+              section = text[header_end:section_end]
+              section = re.sub(rf'(?m)^\s*{re.escape(key)}\.workspace\s*=\s*true\s*\n?', '', section)
+              section = re.sub(rf'(?m)^\s*{re.escape(key)}\s*=\s*"[^"]+"\s*\n?', '', section)
+              section = re.sub(rf'(?m)^\s*{re.escape(key)}\s*=\s*\{{[^\n]*\}}\s*\n?', '', section)
+              return text[:header_end] + section + text[section_end:]
+
+          def insert_or_replace_key(text: str, section_name: str, line: str) -> str:
+              key = line.split("=", 1)[0].strip()
+              text = remove_key_from_section(text, section_name, key)
+              bounds = section_bounds(text, section_name)
+              if not bounds:
+                  suffix = "" if text.endswith("\n") else "\n"
+                  return text + suffix + f"\n[{section_name}]\n{line}\n"
+              _, header_end, _ = bounds
+              return text[:header_end] + "\n" + line + text[header_end:]
+
+          def has_gpui_dependency(text: str) -> bool:
+              return bool(re.search(r'(?m)^\s*gpui(?:\.workspace\s*=|\s*=)', text))
+
+          def ensure_feature(text: str, feature_name: str, feature_value: str) -> str:
+              line = f'{feature_name} = {feature_value}'
+              return insert_or_replace_key(text, "features", line)
 
           def force_gpui(cargo_toml: Path):
               text = cargo_toml.read_text()
               original = text
 
-              had_gpui = bool(re.search(r'(?m)^\s*gpui(?:\.workspace\s*=|\s*=)', text))
-
-              text = re.sub(r'(?m)^\s*gpui\.workspace\s*=\s*true\s*\n?', '', text)
-              text = re.sub(r'(?m)^\s*gpui\s*=\s*"[^"]+"\s*\n?', '', text)
-              text = re.sub(r'(?m)^\s*gpui\s*=\s*\{[^\n]*\}\s*\n?', '', text)
-
-              if not had_gpui:
+              if not has_gpui_dependency(text):
                   return
 
-              dependencies_match = re.search(r'(?m)^\[dependencies\]\s*$', text)
-              if not dependencies_match:
-                  text += "\n[dependencies]\n" + replacement + "\n"
-              else:
-                  insert_at = dependencies_match.end()
-                  text = text[:insert_at] + "\n" + replacement + text[insert_at:]
+              # Normal dependency remains production-safe: no test-support unless
+              # the package explicitly enables it.
+              text = insert_or_replace_key(text, "dependencies", normal_replacement)
+
+              # Make imported packages testable without affecting normal builds.
+              # Cargo only activates dev-dependencies for tests/examples/benches, so
+              # this enables gpui_facade/test-support only for `cargo test` and
+              # `cargo check --all-targets`.
+              text = ensure_feature(text, "test-support", '["gpui/test-support"]')
+              text = insert_or_replace_key(text, "dev-dependencies", test_replacement)
 
               if text != original:
                   cargo_toml.write_text(text)
                   print(f"Forced gpui dependency to local gpui_facade in {cargo_toml}")
+                  print(f"Enabled test-only gpui_facade/test-support for {cargo_toml}")
 
           for item in crates.values():
               target = Path(item["target"])

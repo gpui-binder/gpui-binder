@@ -439,6 +439,10 @@ env:
 
     pub use gpui::*;
 
+    // No extra test re-export is needed here. When the facade feature
+    // `test-support` is enabled, it enables `gpui/test-support`, and upstream
+    // `gpui` itself publicly re-exports `test::*` from `gpui::*`.
+
     pub mod gpui_platform {
         pub use ::gpui_platform::*;
     }
