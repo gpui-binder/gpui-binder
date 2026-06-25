@@ -39,6 +39,7 @@ jobs:
     env:
       TARGET_BRANCH: ${{ inputs.target_branch }}
       SOURCE_ROOT_PACKAGE: ${{ inputs.source_root_package }}
+      CARGO_TARGET_DIR: /tmp/cargo-target
 
     steps:
       - name: Install Linux cargo dependencies
@@ -47,10 +48,9 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get install -y --no-install-recommends \
             libpango1.0-dev \
             libcairo2-dev \
-            build-essential \
             pkg-config \
             libglib2.0-dev \
             libfontconfig1-dev \
@@ -62,6 +62,19 @@ jobs:
             libxcb-shape0-dev \
             libxcb-xfixes0-dev \
             libssl-dev
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            /tmp/cargo-target
+          key: cargo-${{ runner.os }}-${{ inputs.zed_ref }}-${{ inputs.source_repo }}-${{ inputs.source_ref }}-bind-gpui-component-v1
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ inputs.zed_ref }}-${{ inputs.source_repo }}-
+            cargo-${{ runner.os }}-${{ inputs.zed_ref }}-
+            cargo-${{ runner.os }}-
 
       - name: Checkout zed fork
         uses: actions/checkout@v4
@@ -758,21 +771,115 @@ jobs:
                   remove_direct_split_crate_deps(cargo_toml)
 
       - name: Validate generated branch
+        env:
+          CRATES_JSON: ${{ steps.detect.outputs.crates_json }}
         shell: bash
         run: |
           set -euo pipefail
 
-          cargo metadata --no-deps
-          cargo check --workspace --all-targets
+          if [ ! -f Cargo.toml ]; then
+            echo "Missing root Cargo.toml."
+            exit 1
+          fi
+
+          if [ ! -f crates/gpui_facade/Cargo.toml ]; then
+            echo "Missing crates/gpui_facade/Cargo.toml. Run fork-gpui first or use a zed_ref that already contains gpui_facade."
+            exit 1
+          fi
+
+          cargo metadata \
+            --no-deps \
+            --format-version=1 \
+            > "$RUNNER_TEMP/cargo-metadata.json"
+
+          mapfile -t CHECK_PACKAGES < <(python - "$RUNNER_TEMP/cargo-metadata.json" <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          metadata_path = Path(sys.argv[1])
+          crates = json.loads(os.environ["CRATES_JSON"])
+          metadata = json.loads(metadata_path.read_text())
+
+          packages_by_id = {pkg.get("id"): pkg for pkg in metadata.get("packages", []) if pkg.get("id")}
+          workspace_member_ids = metadata.get("workspace_members", [])
+          workspace_packages = [packages_by_id[package_id] for package_id in workspace_member_ids if package_id in packages_by_id]
+
+          if not workspace_member_ids:
+              raise SystemExit("cargo metadata succeeded, but workspace_members is empty")
+
+          workspace_names = {pkg.get("name") for pkg in workspace_packages if pkg.get("name")}
+          workspace_manifest_paths = {str(Path(pkg.get("manifest_path", ""))) for pkg in workspace_packages}
+
+          missing_metadata_ids = [package_id for package_id in workspace_member_ids if package_id not in packages_by_id]
+          if missing_metadata_ids:
+              print("Workspace member IDs missing from metadata packages:")
+              for package_id in missing_metadata_ids:
+                  print(f"  - {package_id}")
+              raise SystemExit("cargo metadata is internally inconsistent")
+
+          missing_imported = []
+          for package, item in sorted(crates.items()):
+              manifest = str((Path.cwd() / item["target"] / "Cargo.toml").resolve())
+              if package not in workspace_names and manifest not in workspace_manifest_paths:
+                  missing_imported.append(f"{package}: {item['target']}/Cargo.toml")
+
+          required = {"gpui_facade", "gpui", "gpui_platform"}
+          missing_required = sorted(name for name in required if name not in workspace_names)
+
+          missing_manifest_files = []
+          for pkg in workspace_packages:
+              manifest = pkg.get("manifest_path")
+              if not manifest or not Path(manifest).is_file():
+                  missing_manifest_files.append((pkg.get("name", "<unnamed>"), manifest or "<missing>"))
+
+          if missing_imported:
+              print("Imported packages not found as workspace members:")
+              for item in missing_imported:
+                  print(f"  - {item}")
+              raise SystemExit("Imported packages are missing from cargo metadata workspace members")
+
+          if missing_required:
+              print("Workspace package names found:")
+              for name in sorted(workspace_names):
+                  print(f"  - {name}")
+              raise SystemExit("Required GPUI packages are missing: " + ", ".join(missing_required))
+
+          if missing_manifest_files:
+              print("Workspace packages with missing Cargo.toml files:")
+              for name, manifest in missing_manifest_files:
+                  print(f"  - {name}: {manifest}")
+              raise SystemExit("One or more workspace package manifests are missing")
+
+          check_packages = sorted(set(crates.keys()) | {"gpui_facade"})
+          for package in check_packages:
+              if package not in workspace_names:
+                  raise SystemExit(f"Package selected for cargo check is not in workspace metadata: {package}")
+              print(package)
+          PY
+          )
+
+          CARGO_ARGS=()
+          for package in "${CHECK_PACKAGES[@]}"; do
+            CARGO_ARGS+=("-p" "$package")
+          done
+
+          echo "Checking imported package graph only:"
+          printf '  - %s\n' "${CHECK_PACKAGES[@]}"
+          cargo check "${CARGO_ARGS[@]}" --all-targets
 
           {
             echo "## Validation summary"
             echo
             echo "Validated generated branch with:"
-            echo "- cargo metadata --no-deps"
-            echo "- cargo check --workspace --all-targets"
+            echo "- cargo metadata --no-deps --format-version=1"
+            echo "- cargo check for imported packages plus gpui_facade only"
             echo
-            echo "Imported packages:"
+            echo "Checked packages:"
+            printf -- "- %s\n" "${CHECK_PACKAGES[@]}"
+            echo
+            echo "Imported package paths:"
             python - <<'PY'
           import json
           import os
