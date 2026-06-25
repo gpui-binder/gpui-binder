@@ -479,6 +479,16 @@ jobs:
     name: Generate modified branch
     runs-on: ubuntu-latest
 
+    env:
+      UPSTREAM_REPO_INPUT: ${{ inputs.upstream_repo }}
+      UPSTREAM_BRANCH_INPUT: ${{ inputs.upstream_branch }}
+      OUTPUT_BRANCH_INPUT: ${{ inputs.output_branch }}
+      COMMIT_MESSAGE_INPUT: ${{ inputs.commit_message }}
+      FORCE_PUSH_INPUT: ${{ inputs.force_push }}
+      RUN_NUMBER_VALUE: ${{ github.run_number }}
+      TARGET_REPOSITORY: ${{ github.repository }}
+      PUSH_TOKEN: ${{ github.token }}
+
     steps:
       - name: Sparse clone upstream, validate, and create generated branch
         shell: bash
@@ -489,14 +499,14 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          UPSTREAM_REPO="${{ inputs.upstream_repo }}"
-          UPSTREAM_BRANCH="${{ inputs.upstream_branch }}"
+          UPSTREAM_REPO="${UPSTREAM_REPO_INPUT}"
+          UPSTREAM_BRANCH="${UPSTREAM_BRANCH_INPUT}"
 
-          OUTPUT_BRANCH="${{ inputs.output_branch }}"
+          OUTPUT_BRANCH="${OUTPUT_BRANCH_INPUT}"
           if [ -z "$OUTPUT_BRANCH" ]; then
             SAFE_REPO="$(printf '%s' "$UPSTREAM_REPO" | tr '/:@ ' '----')"
             SAFE_BRANCH="$(printf '%s' "$UPSTREAM_BRANCH" | tr '/:@ ' '----')"
-            OUTPUT_BRANCH="generated-${SAFE_REPO}-${SAFE_BRANCH}-${{ github.run_number }}"
+            OUTPUT_BRANCH="generated-${SAFE_REPO}-${SAFE_BRANCH}-${RUN_NUMBER_VALUE}"
           fi
 
           echo "Upstream repo: ${UPSTREAM_REPO}"
@@ -1248,9 +1258,9 @@ jobs:
             exit 1
           fi
 
-          git commit -m "${{ inputs.commit_message }}"
+          git commit -m "${COMMIT_MESSAGE_INPUT}"
 
-          git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git remote add origin "https://x-access-token:${PUSH_TOKEN}@github.com/${TARGET_REPOSITORY}.git"
 
           REMOTE_BRANCH_EXISTS=false
 
@@ -1267,7 +1277,7 @@ jobs:
             fi
           fi
 
-          if [ "${{ inputs.force_push }}" = "true" ]; then
+          if [ "${FORCE_PUSH_INPUT}" = "true" ]; then
             git push --force-with-lease origin "HEAD:$OUTPUT_BRANCH"
           else
             git push origin "HEAD:$OUTPUT_BRANCH"
@@ -1278,7 +1288,7 @@ jobs:
             echo ""
             echo "- Source: \`${UPSTREAM_REPO}\`"
             echo "- Source branch: \`${UPSTREAM_BRANCH}\`"
-            echo "- Output repo: \`${{ github.repository }}\`"
+            echo "- Output repo: \`${TARGET_REPOSITORY}\`"
             echo "- Output branch: \`${OUTPUT_BRANCH}\`"
             echo ""
             echo "Validation:"
