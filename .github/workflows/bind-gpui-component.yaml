@@ -40,13 +40,51 @@ jobs:
       TARGET_BRANCH: ${{ inputs.target_branch }}
       SOURCE_ROOT_PACKAGE: ${{ inputs.source_root_package }}
       CARGO_TARGET_DIR: /tmp/cargo-target
+      CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+      CARGO_INCREMENTAL: 0
 
     steps:
-      - name: Install Linux cargo dependencies
+      - name: Install missing Linux cargo dependencies
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
+
+          pkg_config_modules=(
+            gtk+-3.0
+            gdk-pixbuf-2.0
+            atk
+            pango
+            cairo
+            glib-2.0
+            fontconfig
+            xkbcommon
+            wayland-client
+            x11
+            xcb
+            xcb-render
+            xcb-shape
+            xcb-xfixes
+            openssl
+          )
+
+          missing=false
+          if ! command -v pkg-config >/dev/null 2>&1; then
+            missing=true
+          else
+            for module in "${pkg_config_modules[@]}"; do
+              if ! pkg-config --exists "$module"; then
+                missing=true
+                break
+              fi
+            done
+          fi
+
+          if [ "$missing" = "false" ]; then
+            echo "All Linux native cargo dependencies are already available; skipping apt."
+            exit 0
+          fi
+
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config \
@@ -67,23 +105,26 @@ jobs:
             libssl-dev
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/.rustup/toolchains
+            ~/.rustup/update-hashes
             /tmp/cargo-target
-          key: cargo-${{ runner.os }}-${{ inputs.zed_ref }}-${{ inputs.source_repo }}-${{ inputs.source_ref }}-bind-gpui-component-v1
+          key: cargo-${{ runner.os }}-${{ inputs.zed_ref }}-${{ inputs.source_repo }}-${{ inputs.source_ref }}-bind-gpui-component-v2-${{ github.run_id }}
           restore-keys: |
+            cargo-${{ runner.os }}-${{ inputs.zed_ref }}-${{ inputs.source_repo }}-${{ inputs.source_ref }}-bind-gpui-component-v2-
             cargo-${{ runner.os }}-${{ inputs.zed_ref }}-${{ inputs.source_repo }}-
             cargo-${{ runner.os }}-${{ inputs.zed_ref }}-
             cargo-${{ runner.os }}-
 
       - name: Checkout zed fork
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ inputs.zed_ref }}
-          fetch-depth: 0
+          fetch-depth: 1
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Configure git identity
@@ -100,7 +141,7 @@ jobs:
           git checkout -B "${TARGET_BRANCH}"
 
       - name: Checkout gpui-component source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ${{ inputs.source_repo }}
           ref: ${{ inputs.source_ref }}
@@ -309,6 +350,8 @@ jobs:
         id: resource_validation
         env:
           CRATES_JSON: ${{ steps.detect.outputs.crates_json }}
+          SOURCE_REPO: ${{ inputs.source_repo }}
+          SOURCE_REF: ${{ inputs.source_ref }}
         shell: python
         run: |
           from pathlib import Path
@@ -412,6 +455,53 @@ jobs:
                   # the original path into ../ style. The failure reason explains it.
                   return resolved.as_posix()
 
+          readme_name_pattern = re.compile(r"^README(?:\..+)?\.md$", re.IGNORECASE)
+
+          def is_source_root_readme(path: Path) -> bool:
+              try:
+                  path = path.resolve()
+                  return path.parent == source_root and readme_name_pattern.match(path.name) is not None
+              except OSError:
+                  return False
+
+          def renamed_readme_name(name: str) -> str:
+              if name.lower() == "readme.md":
+                  return "README-gpui-component.md"
+              return re.sub(r"^README", "README-gpui-component", name, count=1, flags=re.IGNORECASE)
+
+          def markdown_source_header() -> str:
+              repo = os.environ.get("SOURCE_REPO", "").strip() or "unknown/repository"
+              ref = os.environ.get("SOURCE_REF", "").strip() or "unknown-ref"
+              return f"> Original source: [{repo} @ {ref}](https://github.com/{repo}/tree/{ref})\n\n"
+
+          def write_markdown_with_source_header(source: Path, target: Path) -> None:
+              try:
+                  body = source.read_text(encoding="utf-8")
+              except UnicodeDecodeError:
+                  body = source.read_text(errors="replace")
+              header = markdown_source_header()
+              if body.startswith(header):
+                  output = body
+              else:
+                  output = header + body
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_text(output, encoding="utf-8")
+
+          for source_readme in sorted(source_root.iterdir() if source_root.exists() else []):
+              if not source_readme.is_file() or not is_source_root_readme(source_readme):
+                  continue
+              target_readme = workspace_root / renamed_readme_name(source_readme.name)
+              write_markdown_with_source_header(source_readme, target_readme)
+              imported.append({
+                  "package": "gpui-component",
+                  "file": source_readme.name,
+                  "line": 0,
+                  "path": source_readme.name,
+                  "source_resolved": str(source_readme.resolve()),
+                  "target_resolved": str(target_readme.resolve()),
+                  "reason": "renamed gpui-component README copied from source checkout",
+              })
+
           for package, item in sorted(crates.items()):
               source_pkg_dir = Path(item["source"]).resolve()
               target_pkg_dir = Path(item["target"]).resolve()
@@ -474,6 +564,18 @@ jobs:
                       for rel_path_text in rel_paths:
                           source_resolved = (source_rs.parent / rel_path_text).resolve()
                           target_resolved = (target_rs.parent / rel_path_text).resolve()
+
+                          if is_source_root_readme(source_resolved):
+                              renamed_target = (workspace_root / renamed_readme_name(source_resolved.name)).resolve()
+                              rewritten_rel_path = os.path.relpath(renamed_target, start=target_rs.parent).replace(os.sep, "/")
+                              if rewritten_rel_path != rel_path_text:
+                                  try:
+                                      target_text = target_rs.read_text(encoding="utf-8")
+                                  except UnicodeDecodeError:
+                                      target_text = target_rs.read_text(errors="replace")
+                                  if rel_path_text in target_text:
+                                      target_rs.write_text(target_text.replace(rel_path_text, rewritten_rel_path), encoding="utf-8")
+                              target_resolved = renamed_target
 
                           reference = {
                               "package": package,
@@ -575,7 +677,7 @@ jobs:
                       rows = []
                       for row in imported:
                           imported_row = dict(row)
-                          imported_row["reason"] = "copied from gpui-component source checkout"
+                          imported_row.setdefault("reason", "copied from gpui-component source checkout")
                           rows.append(imported_row)
                       write_rows(summary, rows)
                       summary.write("\n")
@@ -726,6 +828,13 @@ jobs:
                   i += 1
               return "".join(result)
 
+          def split_trailing_blank_lines(section: str) -> tuple[str, str]:
+              lines = section.splitlines(keepends=True)
+              index = len(lines)
+              while index > 0 and lines[index - 1].strip() == "":
+                  index -= 1
+              return "".join(lines[:index]), "".join(lines[index:])
+
           def set_dependency_entry(text: str, section_name: str, key: str, value: str) -> str:
               text = ensure_section(text, section_name)
               bounds = section_bounds(text, section_name)
@@ -734,10 +843,13 @@ jobs:
               _, _, body_start, section_end = bounds
               section = text[body_start:section_end]
               section = remove_dependency_entry(section, key)
-              if section and not section.endswith("\n"):
-                  section += "\n"
-              section += f"{key} = {value}\n"
-              return text[:body_start] + section + text[section_end:]
+              body, trailing_blank = split_trailing_blank_lines(section)
+              if body and not body.endswith("\n"):
+                  body += "\n"
+              body += f"{key} = {value}\n"
+              if not trailing_blank and section_end < len(text):
+                  trailing_blank = "\n"
+              return text[:body_start] + body + trailing_blank + text[section_end:]
 
           imported_members = sorted(
               item["target"]

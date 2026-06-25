@@ -173,12 +173,16 @@ jobs:
                 "/repos/$REPO/actions/runs/$run_id" \
                 --silent; then
                 total_deleted=$((total_deleted + 1))
+
+                # Keep a light throttle for secondary-rate-limit friendliness, but
+                # avoid paying 0.5s for every single deletion.
+                if [ $((total_deleted % 20)) -eq 0 ]; then
+                  sleep 1
+                fi
               else
                 echo "::warning::Failed to delete run ID: $run_id"
                 total_failed=$((total_failed + 1))
               fi
-
-              sleep 0.5
             done < "$candidates_file"
           done < "$workflows_file"
 
