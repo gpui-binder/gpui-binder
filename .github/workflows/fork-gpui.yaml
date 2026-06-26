@@ -1193,6 +1193,14 @@ jobs:
 
               new_default_members.append(item)
 
+          if not new_default_members and generated_member in member_set:
+              # The generated branch has a virtual workspace. Cargo uses
+              # default-members for root package commands when present; keeping
+              # an explicit empty array makes root `cargo check` unexpectedly
+              # select nothing. Fall back to the facade package instead of
+              # hard-coding upstream Zed members that may change.
+              new_default_members.append(generated_member)
+
           new_exclude = unique_preserve_order(
               existing_exclude + sorted(remove_from_workspace)
           )

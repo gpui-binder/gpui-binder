@@ -232,7 +232,12 @@ jobs:
           The dependency revision below intentionally points to the generated source commit before this README commit:
 
           \`\`\`toml
-          gpui = { git = "https://github.com/gpui-binder/gpui-binder", package = "gpui_facade", rev = "${PRE_README_COMMIT}", features = ["gpui_macos", "gpui_web", "gpui_macros", "font-kit", "x11", "wayland", "runtime_shaders"] }
+          # Pick the target feature set you actually build. Examples:
+          # macOS desktop: features = ["gpui_macros", "gpui_macos", "font-kit", "runtime_shaders"]
+          # Linux desktop: features = ["gpui_macros", "gpui_linux", "x11", "wayland", "font-kit", "runtime_shaders"]
+          # Windows desktop: features = ["gpui_macros", "gpui_windows", "font-kit", "runtime_shaders", "windows-manifest"]
+          # Web/WASM: features = ["gpui_macros", "gpui_web"]
+          gpui = { git = "https://github.com/gpui-binder/gpui-binder", package = "gpui_facade", rev = "${PRE_README_COMMIT}", default-features = false, features = ["gpui_macros"] }
           gpui-component = { git = "https://github.com/gpui-binder/gpui-binder", package = "gpui-component", rev = "${PRE_README_COMMIT}" }
           \`\`\`
 

@@ -360,66 +360,140 @@ jobs:
           root = Path("Cargo.toml")
           text = root.read_text()
 
-          members_to_add = sorted(
+          def unique(values):
+              seen = set()
+              out = []
+              for value in values:
+                  if value in seen:
+                      continue
+                  seen.add(value)
+                  out.append(value)
+              return out
+
+          def ensure_workspace_table(text: str) -> str:
+              if re.search(r'(?m)^\[workspace\]\s*$', text):
+                  return text
+              suffix = "" if text.endswith("\n") else "\n"
+              return text + suffix + "\n[workspace]\n"
+
+          def workspace_bounds(text: str):
+              match = re.search(r'(?ms)^\[workspace\]\s*(.*?)(?=^\[|\Z)', text)
+              if not match:
+                  raise SystemExit("Could not find [workspace] table")
+              return match.start(), match.end(), match.group(0)
+
+          def read_array(block: str, key: str) -> list[str]:
+              match = re.search(rf'(?ms)^\s*{re.escape(key)}\s*=\s*\[(.*?)\]', block)
+              if not match:
+                  return []
+              return re.findall(r'"([^"]+)"', match.group(1))
+
+          def write_array(block: str, key: str, values: list[str]) -> str:
+              values = unique(values)
+              replacement = f"{key} = [\n"
+              replacement += "".join(f'    "{value}",\n' for value in values)
+              replacement += "]"
+
+              pattern = re.compile(rf'(?ms)^\s*{re.escape(key)}\s*=\s*\[(.*?)\]')
+              match = pattern.search(block)
+              if match:
+                  return block[:match.start()] + replacement + block[match.end():]
+
+              header = re.search(r'(?m)^\[workspace\]\s*$', block)
+              if not header:
+                  raise SystemExit("Could not find [workspace] header")
+              insert_at = header.end()
+              return block[:insert_at] + "\n" + replacement + "\n" + block[insert_at:]
+
+          def section_bounds(text: str, section_name: str):
+              header = re.search(rf'(?m)^\[{re.escape(section_name)}\][^\S\r\n]*$', text)
+              if not header:
+                  return None
+              body_start = header.end()
+              if body_start < len(text) and text[body_start] == "\n":
+                  body_start += 1
+              next_header = re.search(r'(?m)^\[', text[body_start:])
+              section_end = body_start + next_header.start() if next_header else len(text)
+              return header.start(), header.end(), body_start, section_end
+
+          def ensure_section(text: str, section_name: str) -> str:
+              if section_bounds(text, section_name):
+                  return text
+              suffix = "" if text.endswith("\n") else "\n"
+              return text + suffix + f"\n[{section_name}]\n"
+
+          def remove_dependency_entry(section: str, key: str) -> str:
+              lines = section.splitlines(keepends=True)
+              result = []
+              i = 0
+              while i < len(lines):
+                  line = lines[i]
+                  stripped = line.strip()
+                  if re.match(rf'^{re.escape(key)}(?:\.workspace\s*=|\s*=)', stripped):
+                      depth_curly = 0
+                      depth_square = 0
+                      while i < len(lines):
+                          code = lines[i].split("#", 1)[0]
+                          depth_curly += code.count("{") - code.count("}")
+                          depth_square += code.count("[") - code.count("]")
+                          i += 1
+                          if depth_curly <= 0 and depth_square <= 0:
+                              break
+                      continue
+                  result.append(line)
+                  i += 1
+              return "".join(result)
+
+          def set_dependency_entry(text: str, section_name: str, key: str, value: str) -> str:
+              text = ensure_section(text, section_name)
+              bounds = section_bounds(text, section_name)
+              if not bounds:
+                  raise SystemExit(f"Could not find [{section_name}] after creating it")
+              _, _, body_start, section_end = bounds
+              section = text[body_start:section_end]
+              section = remove_dependency_entry(section, key)
+              if section and not section.endswith("\n"):
+                  section += "\n"
+              section += f"{key} = {value}\n"
+              return text[:body_start] + section + text[section_end:]
+
+          imported_members = sorted(
               item["target"]
               for item in crates.values()
-              if Path(item["target"]).exists()
+              if Path(item["target"]).joinpath("Cargo.toml").exists()
           )
 
-          if not re.search(r'(?m)^\[workspace\]\s*$', text):
-              text += "\n[workspace]\n"
+          text = ensure_workspace_table(text)
+          ws_start, ws_end, workspace_block = workspace_bounds(text)
+          existing_members = read_array(workspace_block, "members")
 
-          members_match = re.search(r'(?ms)^members\s*=\s*\[(.*?)\]', text)
+          members = unique(existing_members + imported_members)
+          if Path("crates/gpui_facade/Cargo.toml").exists() and "crates/gpui_facade" not in members:
+              members.append("crates/gpui_facade")
 
-          if members_match:
-              block = members_match.group(0)
-              inner = members_match.group(1)
-              existing_members = set(re.findall(r'"([^"]+)"', inner))
+          # Make root `cargo check` useful on the generated final branch.
+          # This is data-driven from the imported package graph, so future
+          # gpui-component package additions/removals are reflected automatically.
+          default_members = []
+          if Path("crates/gpui_facade/Cargo.toml").exists():
+              default_members.append("crates/gpui_facade")
+          default_members.extend(imported_members)
+          member_set = set(members)
+          default_members = [member for member in unique(default_members) if member in member_set]
 
-              additions = []
-              for member in members_to_add:
-                  if member not in existing_members:
-                      additions.append(f'    "{member}",')
+          workspace_block = write_array(workspace_block, "members", members)
+          workspace_block = write_array(workspace_block, "default-members", default_members)
+          text = text[:ws_start] + workspace_block + text[ws_end:]
 
-              if additions:
-                  new_block = block[:-1].rstrip() + "\n" + "\n".join(additions) + "\n]"
-                  text = text[:members_match.start()] + new_block + text[members_match.end():]
-          else:
-              workspace_match = re.search(r'(?m)^\[workspace\]\s*$', text)
-              insert_at = workspace_match.end()
-
-              member_lines = "\n\nmembers = [\n"
-              for member in members_to_add:
-                  member_lines += f'    "{member}",\n'
-              member_lines += "]\n"
-
-              text = text[:insert_at] + member_lines + text[insert_at:]
-
-          if "[workspace.dependencies]" not in text:
-              text += "\n[workspace.dependencies]\n"
-
-          dep_section = re.search(
-              r'(?ms)^\[workspace\.dependencies\]\s*(.*?)(?=^\[|\Z)',
-              text,
-          )
-
-          deps_to_add = {
-              package: f'{{ path = "{item["target"]}" }}'
-              for package, item in sorted(crates.items())
-              if Path(item["target"]).exists()
-          }
-
-          if dep_section:
-              section = dep_section.group(0)
-              additions = []
-
-              for name, value in deps_to_add.items():
-                  if not re.search(rf'(?m)^\s*{re.escape(name)}\s*=', section):
-                      additions.append(f'{name} = {value}')
-
-              if additions:
-                  new_section = section.rstrip() + "\n" + "\n".join(additions) + "\n"
-                  text = text[:dep_section.start()] + new_section + text[dep_section.end():]
+          for package, item in sorted(crates.items()):
+              target = item["target"]
+              if Path(target).joinpath("Cargo.toml").exists():
+                  text = set_dependency_entry(
+                      text,
+                      "workspace.dependencies",
+                      package,
+                      f'{{ path = "{target}" }}',
+                  )
 
           root.write_text(text)
 
@@ -486,15 +560,27 @@ jobs:
               return entries
 
           source_deps = parse_dependency_entries(extract_section(source_text, "workspace.dependencies"))
-          target_workspace_deps = set(
-              parse_dependency_entries(extract_section(root_text, "workspace.dependencies")).keys()
+          target_workspace_deps = parse_dependency_entries(
+              extract_section(root_text, "workspace.dependencies")
           )
 
-          # Some source dependencies intentionally need the source repo's version,
-          # even when Zed has a workspace dependency with the same name.
-          # gpui-component's LSP code currently uses APIs from lsp-types 0.97;
-          # Zed's workspace lsp-types is older/different and breaks these files.
-          preserve_source_workspace_deps = {"lsp-types"}
+          def entry_has_source_override(entry: str) -> bool:
+              return bool(re.search(r'(?m)\b(?:path|git)\s*=', entry))
+
+          def should_expand_source_workspace_dep(dep_name: str, source_entry: str) -> bool:
+              target_entry = target_workspace_deps.get(dep_name)
+              if not target_entry:
+                  return True
+
+              # If the generated Zed workspace has a path/git override for a
+              # dependency that gpui-component inherited from its own workspace,
+              # do not blindly switch gpui-component to Zed's source. This avoids
+              # hard-coding special cases like lsp-types while still allowing
+              # ordinary crates.io workspace dependencies to be inherited.
+              if entry_has_source_override(target_entry):
+                  return True
+
+              return False
 
           local_packages = {}
           for cargo_toml in Path("crates").glob("*/Cargo.toml"):
@@ -568,7 +654,7 @@ jobs:
                   for dep_name, source_entry in source_deps.items():
                       if dep_name in imported_packages:
                           continue
-                      if dep_name in target_workspace_deps and dep_name not in preserve_source_workspace_deps:
+                      if not should_expand_source_workspace_dep(dep_name, source_entry):
                           continue
                       replacement = rewrite_zed_git_dependency_to_local_for_manifest(
                           source_entry,
@@ -709,81 +795,213 @@ jobs:
           import re
 
           crates = json.loads(os.environ["CRATES_JSON"])
+          facade_root = Path("crates/gpui_facade")
 
-          normal_replacement = 'gpui = { package = "gpui_facade", path = "../gpui_facade", features = ["gpui_macos", "gpui_web", "gpui_macros", "font-kit", "x11", "wayland", "runtime_shaders"] }'
-          test_replacement = 'gpui = { package = "gpui_facade", path = "../gpui_facade", features = ["gpui_macos", "gpui_web", "gpui_macros", "font-kit", "x11", "wayland", "runtime_shaders", "test-support"] }'
+          # Features that are safe and useful for every target using the facade.
+          BASE_FEATURES = ["gpui_macros"]
+          TEST_FEATURES = ["test-support"]
+
+          # Keep platform/native dependencies target-scoped instead of enabling all
+          # facade platform edges in every imported package on every target.
+          TARGET_FEATURES = {
+              'target.\'cfg(target_family = "wasm")\'.dependencies': [
+                  "gpui_web",
+              ],
+              'target.\'cfg(target_os = "macos")\'.dependencies': [
+                  "gpui_macos",
+                  "font-kit",
+                  "runtime_shaders",
+              ],
+              'target.\'cfg(any(target_os = "linux", target_os = "freebsd"))\'.dependencies': [
+                  "gpui_linux",
+                  "x11",
+                  "wayland",
+                  "font-kit",
+                  "runtime_shaders",
+              ],
+              'target.\'cfg(target_os = "windows")\'.dependencies': [
+                  "gpui_windows",
+                  "font-kit",
+                  "runtime_shaders",
+                  "windows-manifest",
+              ],
+          }
+
+          PLATFORM_OR_DEFAULT_FEATURES = {
+              "gpui_web",
+              "gpui_web_multithreaded",
+              "gpui_macos",
+              "gpui_linux",
+              "gpui_windows",
+              "font-kit",
+              "x11",
+              "wayland",
+              "runtime_shaders",
+              "windows-manifest",
+          }
+
+          def unique(values):
+              seen = set()
+              out = []
+              for value in values:
+                  if value in seen:
+                      continue
+                  seen.add(value)
+                  out.append(value)
+              return out
+
+          def quote_list(values):
+              return "[" + ", ".join(f'"{value}"' for value in unique(values)) + "]"
+
+          def gpui_entry(cargo_toml: Path, features: list[str]) -> str:
+              relative_path = os.path.relpath(facade_root, cargo_toml.parent).replace(os.sep, "/")
+              return (
+                  'gpui = { package = "gpui_facade", '
+                  f'path = "{relative_path}", '
+                  'default-features = false, '
+                  f'features = {quote_list(features)} }}'
+              )
 
           def section_bounds(text: str, section_name: str):
-              # Important: do not use \s here because it can consume the newline
-              # after the TOML section header and produce invalid output like
-              # `[dev-dependencies]indoc = "2"`.
               header = re.search(rf'(?m)^\[{re.escape(section_name)}\][^\S\r\n]*$', text)
               if not header:
                   return None
-
               body_start = header.end()
               if body_start < len(text) and text[body_start] == "\n":
                   body_start += 1
-
               next_header = re.search(r'(?m)^\[', text[body_start:])
               section_end = body_start + next_header.start() if next_header else len(text)
               return header.start(), header.end(), body_start, section_end
 
-          def remove_key_from_section(text: str, section_name: str, key: str) -> str:
+          def ensure_section(text: str, section_name: str) -> str:
+              if section_bounds(text, section_name):
+                  return text
+              suffix = "" if text.endswith("\n") else "\n"
+              return text + suffix + f"\n[{section_name}]\n"
+
+          def dependency_section_names(text: str) -> list[str]:
+              names = []
+              for match in re.finditer(r'(?m)^\[([^\]]+)\][^\S\r\n]*$', text):
+                  name = match.group(1)
+                  if name == "workspace.dependencies":
+                      continue
+                  if name in {"dependencies", "dev-dependencies"}:
+                      names.append(name)
+                  elif name.startswith("target.") and name.endswith((".dependencies", ".dev-dependencies")):
+                      names.append(name)
+              return names
+
+          def take_named_entries(section: str, key: str):
+              lines = section.splitlines(keepends=True)
+              kept = []
+              removed = []
+              i = 0
+              while i < len(lines):
+                  line = lines[i]
+                  stripped = line.strip()
+                  if re.match(rf'^{re.escape(key)}(?:\.workspace\s*=|\s*=)', stripped):
+                      current = []
+                      depth_curly = 0
+                      depth_square = 0
+                      while i < len(lines):
+                          current.append(lines[i])
+                          code = lines[i].split("#", 1)[0]
+                          depth_curly += code.count("{") - code.count("}")
+                          depth_square += code.count("[") - code.count("]")
+                          i += 1
+                          if depth_curly <= 0 and depth_square <= 0:
+                              break
+                      removed.append("".join(current))
+                      continue
+                  kept.append(line)
+                  i += 1
+              return "".join(kept), removed
+
+          def remove_gpui_from_section(text: str, section_name: str):
               bounds = section_bounds(text, section_name)
               if not bounds:
-                  return text
-
+                  return text, []
               _, _, body_start, section_end = bounds
-              prefix = text[:body_start]
-              section = text[body_start:section_end]
-              suffix = text[section_end:]
+              section, removed = take_named_entries(text[body_start:section_end], "gpui")
+              return text[:body_start] + section + text[section_end:], removed
 
-              # Remove common one-line TOML dependency/feature forms.
-              section = re.sub(rf'(?m)^\s*{re.escape(key)}\.workspace\s*=\s*true\s*(?:#.*)?\n?', '', section)
-              section = re.sub(rf'(?m)^\s*{re.escape(key)}\s*=\s*"[^"]+"\s*(?:#.*)?\n?', '', section)
-              section = re.sub(rf'(?m)^\s*{re.escape(key)}\s*=\s*\{{[^\n]*\}}\s*(?:#.*)?\n?', '', section)
-              section = re.sub(rf'(?m)^\s*{re.escape(key)}\s*=\s*\[[^\n]*\]\s*(?:#.*)?\n?', '', section)
-              return prefix + section + suffix
+          def set_key_in_section(text: str, section_name: str, key: str, line: str) -> str:
+              text = ensure_section(text, section_name)
+              bounds = section_bounds(text, section_name)
+              if not bounds:
+                  raise SystemExit(f"Could not find [{section_name}] after creating it")
+              _, _, body_start, section_end = bounds
+              section, _ = take_named_entries(text[body_start:section_end], key)
+              if section and not section.endswith("\n"):
+                  section += "\n"
+              section += line + "\n"
+              return text[:body_start] + section + text[section_end:]
 
           def insert_or_replace_key(text: str, section_name: str, line: str) -> str:
               key = line.split("=", 1)[0].strip()
-              text = remove_key_from_section(text, section_name, key)
-              bounds = section_bounds(text, section_name)
+              return set_key_in_section(text, section_name, key, line)
 
-              if not bounds:
-                  suffix = "" if text.endswith("\n") else "\n"
-                  return text + suffix + f"\n[{section_name}]\n{line}\n"
-
-              _, header_end, body_start, _ = bounds
-              return text[:header_end] + "\n" + line + "\n" + text[body_start:]
-
-          def has_gpui_dependency(text: str) -> bool:
-              return bool(re.search(r'(?m)^\s*gpui(?:\.workspace\s*=|\s*=)', text))
-
-          def ensure_feature(text: str, feature_name: str, feature_value: str) -> str:
-              return insert_or_replace_key(text, "features", f'{feature_name} = {feature_value}')
+          def features_from_entries(entries: list[str]) -> list[str]:
+              features = []
+              for entry in entries:
+                  for match in re.finditer(r'features\s*=\s*\[(.*?)\]', entry, re.S):
+                      features.extend(re.findall(r'"([^"]+)"', match.group(1)))
+              return unique(features)
 
           def force_gpui(cargo_toml: Path):
               text = cargo_toml.read_text()
               original = text
+              removed_entries = []
 
-              if not has_gpui_dependency(text):
+              for section_name in dependency_section_names(text):
+                  text, removed = remove_gpui_from_section(text, section_name)
+                  removed_entries.extend(removed)
+
+              if not removed_entries:
                   return
 
-              # Production dependency remains unchanged and does not enable
-              # gpui_facade/test-support.
-              text = insert_or_replace_key(text, "dependencies", normal_replacement)
+              existing_features = features_from_entries(removed_entries)
+              common_features = [
+                  feature
+                  for feature in existing_features
+                  if feature not in PLATFORM_OR_DEFAULT_FEATURES and feature not in TEST_FEATURES
+              ]
+              common_features = unique(BASE_FEATURES + common_features)
+
+              text = insert_or_replace_key(
+                  text,
+                  "dependencies",
+                  gpui_entry(cargo_toml, common_features),
+              )
+
+              for section_name, features in TARGET_FEATURES.items():
+                  target_features = list(features)
+                  if section_name.startswith('target.\'cfg(target_family = "wasm")') and "gpui_web_multithreaded" in existing_features:
+                      target_features.append("gpui_web_multithreaded")
+                  text = insert_or_replace_key(
+                      text,
+                      section_name,
+                      gpui_entry(cargo_toml, target_features),
+                  )
 
               # Test-only opt-in for imported packages whose tests use #[gpui::test].
               # Cargo activates dev-dependencies only for tests/examples/benches, so
               # normal users are not affected by this feature.
-              text = ensure_feature(text, "test-support", '["gpui/test-support"]')
-              text = insert_or_replace_key(text, "dev-dependencies", test_replacement)
+              text = insert_or_replace_key(
+                  text,
+                  "features",
+                  'test-support = ["gpui/test-support"]',
+              )
+              text = insert_or_replace_key(
+                  text,
+                  "dev-dependencies",
+                  gpui_entry(cargo_toml, unique(common_features + TEST_FEATURES)),
+              )
 
               if text != original:
                   cargo_toml.write_text(text)
                   print(f"Forced gpui dependency to local gpui_facade in {cargo_toml}")
+                  print(f"Moved platform-specific gpui_facade features into target-specific dependency tables in {cargo_toml}")
                   print(f"Enabled test-only gpui_facade/test-support for {cargo_toml}")
 
           for item in crates.values():
