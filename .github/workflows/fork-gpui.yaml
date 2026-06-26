@@ -1507,6 +1507,322 @@ jobs:
           PY
           }
 
+
+          prune_unused_member_dependencies() {
+            echo "Pruning unused normal dependencies from workspace member manifests"
+
+            cd "$OUT_DIR"
+
+            python3 - "${GITHUB_STEP_SUMMARY:-}" <<'PY'
+          from pathlib import Path
+          import os
+          import re
+          import sys
+          import tomllib
+
+          root = Path.cwd().resolve()
+          root_manifest = root / "Cargo.toml"
+          summary_arg = sys.argv[1] if len(sys.argv) > 1 else ""
+          summary_path = Path(summary_arg) if summary_arg else None
+
+          SOURCE_SUFFIXES = {".rs"}
+          SKIP_DIR_NAMES = {".git", "target", "node_modules"}
+          PROTECTED_DEP_KEYS = {
+              # Generated/local facade deps are intentionally managed elsewhere.
+              "gpui",
+              "gpui_facade",
+          }
+
+          def markdown_cell(value) -> str:
+              return str(value).replace("|", "\\|").replace("\n", "<br>")
+
+          def read_toml(path: Path):
+              try:
+                  return tomllib.loads(path.read_text(encoding="utf-8"))
+              except Exception as exc:
+                  raise SystemExit(f"Could not parse {path}: {exc}")
+
+          def section_header_name(header_line: str) -> str | None:
+              match = re.match(r'^\s*\[([^\]]+)\]\s*$', header_line)
+              return match.group(1) if match else None
+
+          def iter_sections(text: str):
+              matches = list(re.finditer(r'(?m)^\s*\[[^\]]+\]\s*$', text))
+              for index, match in enumerate(matches):
+                  name = section_header_name(match.group(0))
+                  if not name:
+                      continue
+                  body_start = match.end()
+                  if body_start < len(text) and text[body_start] == "\n":
+                      body_start += 1
+                  section_end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+                  yield name, match.start(), match.end(), body_start, section_end, text[body_start:section_end]
+
+          def dependency_section_kind(section_name: str) -> str | None:
+              if section_name == "dependencies" or section_name.endswith(".dependencies"):
+                  return "normal"
+              if section_name == "dev-dependencies" or section_name.endswith(".dev-dependencies"):
+                  return "dev"
+              if section_name == "build-dependencies" or section_name.endswith(".build-dependencies"):
+                  return "build"
+              return None
+
+          def strip_inline_comment(line: str) -> str:
+              in_string = False
+              escape = False
+              out = []
+              for ch in line:
+                  if escape:
+                      out.append(ch)
+                      escape = False
+                      continue
+                  if ch == "\\":
+                      out.append(ch)
+                      escape = True
+                      continue
+                  if ch == '"':
+                      in_string = not in_string
+                      out.append(ch)
+                      continue
+                  if ch == "#" and not in_string:
+                      break
+                  out.append(ch)
+              return "".join(out)
+
+          def entry_key(line: str) -> str | None:
+              stripped = line.strip()
+              if not stripped or stripped.startswith("#"):
+                  return None
+              match = re.match(r'^([A-Za-z0-9_.-]+)\s*(?:=|\.)', stripped)
+              if not match:
+                  return None
+              key = match.group(1)
+              if key.endswith(".workspace"):
+                  key = key[: -len(".workspace")]
+              return key
+
+          def parse_entries(section: str):
+              lines = section.splitlines(keepends=True)
+              entries = []
+              current = []
+              current_key = None
+              depth_curly = 0
+              depth_square = 0
+
+              def flush():
+                  nonlocal current, current_key, depth_curly, depth_square
+                  if current_key is not None:
+                      entries.append((current_key, "".join(current)))
+                  current = []
+                  current_key = None
+                  depth_curly = 0
+                  depth_square = 0
+
+              for line in lines:
+                  if current_key is None:
+                      key = entry_key(line)
+                      if key is None:
+                          entries.append((None, line))
+                          continue
+                      current_key = key
+                      current = [line]
+                  else:
+                      current.append(line)
+
+                  code = strip_inline_comment(line)
+                  depth_curly += code.count("{") - code.count("}")
+                  depth_square += code.count("[") - code.count("]")
+                  if depth_curly <= 0 and depth_square <= 0:
+                      flush()
+
+              if current_key is not None:
+                  flush()
+              return entries
+
+          def dependency_value_from_entry(entry_text: str, dep_name: str):
+              try:
+                  data = tomllib.loads("[dependencies]\n" + entry_text)
+                  deps = data.get("dependencies", {})
+                  if dep_name in deps:
+                      return deps[dep_name]
+              except Exception:
+                  pass
+              if re.match(rf'(?m)^\s*{re.escape(dep_name)}\.workspace\s*=\s*true\s*$', entry_text):
+                  return {"workspace": True}
+              return None
+
+          def extract_features_text(manifest_text: str) -> str:
+              for name, _header_start, _header_end, _body_start, _section_end, body in iter_sections(manifest_text):
+                  if name == "features":
+                      return body
+              return ""
+
+          def metadata_ignored_deps(data: dict) -> set[str]:
+              metadata = data.get("package", {}).get("metadata", {})
+              machete = metadata.get("cargo-machete", {}) if isinstance(metadata, dict) else {}
+              ignored = machete.get("ignored", []) if isinstance(machete, dict) else []
+              return {str(item) for item in ignored if isinstance(item, str)}
+
+          def is_dependency_feature_referenced(dep_name: str, features_text: str) -> bool:
+              if not features_text:
+                  return False
+              normalized_dep = dep_name.replace("-", "_")
+              normalized_features = features_text.replace("-", "_")
+              if re.search(rf'(?<![A-Za-z0-9_])dep:{re.escape(normalized_dep)}(?![A-Za-z0-9_])', normalized_features):
+                  return True
+              if re.search(rf'(?m)^\s*{re.escape(dep_name)}\s*=', features_text):
+                  return True
+              if re.search(rf'(?<![A-Za-z0-9_]){re.escape(normalized_dep)}(?:/|\b)', normalized_features):
+                  return True
+              return False
+
+          def source_search_text(package_dir: Path) -> str:
+              chunks = []
+              for path in sorted(package_dir.rglob("*")):
+                  if not path.is_file() or path.suffix not in SOURCE_SUFFIXES:
+                      continue
+                  if any(part in SKIP_DIR_NAMES for part in path.parts):
+                      continue
+                  try:
+                      chunks.append(path.read_text(encoding="utf-8", errors="ignore"))
+                  except Exception:
+                      continue
+              return "\n".join(chunks).replace("-", "_")
+
+          def dep_identifier(dep_name: str) -> str:
+              return dep_name.replace("-", "_")
+
+          def identifier_is_referred(dep_name: str, searchable_text: str) -> bool:
+              ident = dep_identifier(dep_name)
+              return re.search(rf'(?<![A-Za-z0-9_]){re.escape(ident)}(?![A-Za-z0-9_])', searchable_text) is not None
+
+          def remove_deps_from_sections(manifest_text: str, remove_by_section: dict[tuple[int, int], set[str]]) -> str:
+              replacements = []
+              for name, _header_start, _header_end, body_start, section_end, body in iter_sections(manifest_text):
+                  remove_names = remove_by_section.get((body_start, section_end))
+                  if not remove_names:
+                      continue
+                  rebuilt = []
+                  for key, entry in parse_entries(body):
+                      if key is not None and key in remove_names:
+                          continue
+                      rebuilt.append(entry)
+                  replacements.append((body_start, section_end, "".join(rebuilt)))
+              for body_start, section_end, new_body in reversed(replacements):
+                  manifest_text = manifest_text[:body_start] + new_body + manifest_text[section_end:]
+              return manifest_text
+
+          def read_workspace_members(root_text: str) -> list[str]:
+              match = re.search(r'(?ms)^\[workspace\]\s*(.*?)(?=^\[|\Z)', root_text)
+              if not match:
+                  return []
+              body = match.group(1)
+              arr = re.search(r'(?ms)^\s*members\s*=\s*\[(.*?)\]', body)
+              if not arr:
+                  return []
+              return re.findall(r'"([^"]+)"', arr.group(1))
+
+          def package_name_for_manifest(data: dict, cargo_toml: Path) -> str:
+              return data.get("package", {}).get("name") or cargo_toml.parent.name
+
+          root_text = root_manifest.read_text(encoding="utf-8")
+          member_paths = read_workspace_members(root_text)
+          member_manifests = []
+          for member in member_paths:
+              if "*" in member:
+                  for cargo_toml in sorted(root.glob(member + "/Cargo.toml")):
+                      if cargo_toml.is_file():
+                          member_manifests.append(cargo_toml.resolve())
+              else:
+                  cargo_toml = (root / member / "Cargo.toml").resolve()
+                  if cargo_toml.is_file():
+                      member_manifests.append(cargo_toml)
+          member_manifests = sorted(set(member_manifests))
+
+          removed_rows = []
+
+          for cargo_toml in member_manifests:
+              package_dir = cargo_toml.parent
+              manifest_text = cargo_toml.read_text(encoding="utf-8")
+              data = read_toml(cargo_toml)
+              package_name = package_name_for_manifest(data, cargo_toml)
+              ignored_deps = metadata_ignored_deps(data)
+              features_text = extract_features_text(manifest_text)
+              searchable = source_search_text(package_dir)
+              remove_by_section = {}
+
+              for section_name, _header_start, _header_end, body_start, section_end, body in iter_sections(manifest_text):
+                  kind = dependency_section_kind(section_name)
+                  if kind != "normal":
+                      continue
+
+                  for dep_name, entry_text in parse_entries(body):
+                      if dep_name is None:
+                          continue
+                      value = dependency_value_from_entry(entry_text, dep_name)
+                      if value is None:
+                          continue
+                      if dep_name in PROTECTED_DEP_KEYS or dep_name in ignored_deps:
+                          continue
+                      if isinstance(value, dict) and value.get("optional") is True:
+                          continue
+                      if is_dependency_feature_referenced(dep_name, features_text):
+                          continue
+                      if identifier_is_referred(dep_name, searchable):
+                          continue
+
+                      remove_by_section.setdefault((body_start, section_end), set()).add(dep_name)
+                      removed_rows.append({
+                          "package": package_name,
+                          "manifest": cargo_toml.relative_to(root).as_posix(),
+                          "section": section_name,
+                          "dependency": dep_name,
+                          "searched": dep_identifier(dep_name),
+                          "reason": "dependency key not found in member Rust sources after - to _ normalization",
+                      })
+
+              if remove_by_section:
+                  new_text = remove_deps_from_sections(manifest_text, remove_by_section)
+                  cargo_toml.write_text(new_text, encoding="utf-8")
+                  removed_names = sorted({name for names in remove_by_section.values() for name in names})
+                  print(f"Pruned unused member dependencies from {cargo_toml.relative_to(root)}: {', '.join(removed_names)}")
+
+          if summary_path:
+              with summary_path.open("a", encoding="utf-8") as summary:
+                  summary.write("\n### fork-gpui member dependency pruning\n")
+                  summary.write(
+                      "Rule: for normal workspace member dependencies, convert the dependency key `-` to `_` "
+                      "and remove the dependency when that identifier is not found in that member's Rust sources. "
+                      "Optional, feature-referenced, build/dev, cargo-machete ignored, and generated gpui facade dependencies are kept.\n\n"
+                  )
+                  if removed_rows:
+                      summary.write("| Package | Manifest | Section | Removed dependency | Searched identifier | Reason |\n")
+                      summary.write("|---|---|---|---|---|---|\n")
+                      for row in removed_rows[:160]:
+                          summary.write(
+                              "| "
+                              + markdown_cell(row["package"])
+                              + " | `"
+                              + markdown_cell(row["manifest"])
+                              + "` | `"
+                              + markdown_cell(row["section"])
+                              + "` | `"
+                              + markdown_cell(row["dependency"])
+                              + "` | `"
+                              + markdown_cell(row["searched"])
+                              + "` | "
+                              + markdown_cell(row["reason"])
+                              + " |\n"
+                          )
+                      if len(removed_rows) > 160:
+                          summary.write(f"\nOnly the first 160 removed dependency rows are shown out of {len(removed_rows)}.\n")
+                  else:
+                      summary.write("No unused normal workspace member dependencies were pruned.\n")
+
+          print(f"Member dependency pruning scanned {len(member_manifests)} workspace member manifest(s) and removed {len(removed_rows)} dependency entrie(s).")
+          PY
+          }
+
           validate_gpui_facade_features() {
             echo "Validating gpui_facade feature mirror and feature references"
 
@@ -1981,6 +2297,9 @@ jobs:
 
           CURRENT_STAGE="amend root Cargo.toml workspace"
           amend_root_cargo_toml_for_workspace
+
+          CURRENT_STAGE="prune unused member dependencies"
+          prune_unused_member_dependencies
 
           CURRENT_STAGE="validate gpui_facade features"
           validate_gpui_facade_features
