@@ -6,7 +6,7 @@ name: Import gpui-component
       zed_ref:
         description: "Branch, tag, or SHA of this zed fork to use as the base"
         required: true
-        default: "main"
+        default: "generated-gpui-base-evaluate"
 
       source_repo:
         description: "Repository to import from"
@@ -26,7 +26,7 @@ name: Import gpui-component
       target_branch:
         description: "Branch to create/update with the generated import"
         required: true
-        default: "generated"
+        default: "generated-gpui-binded-evaluate"
 
 permissions:
   contents: write
