@@ -306,6 +306,7 @@ jobs:
               print(f"Imported {package}: {source} -> {target}")
 
       - name: Import and validate relative path resources used by Rust files
+        id: resource_validation
         env:
           CRATES_JSON: ${{ steps.detect.outputs.crates_json }}
         shell: python
@@ -389,11 +390,27 @@ jobs:
           missing = []
           source_missing = []
           outside_source = []
+          outside_workspace = []
           scanned_rs_files = 0
           skipped_node_modules_rs_files = 0
 
           def has_node_modules_part(path: Path) -> bool:
               return "node_modules" in path.parts
+
+          def generated_path_for_summary(path) -> str:
+              # Summary display only: show the resolved generated path relative
+              # to the generated repository root. Example:
+              # /home/runner/work/gpui-binder/gpui-binder/themes/alduin.json
+              # -> themes/alduin.json
+              path = Path(str(path))
+              resolved = path if path.is_absolute() else (workspace_root / path)
+              resolved = resolved.resolve()
+              try:
+                  return resolved.relative_to(workspace_root).as_posix()
+              except ValueError:
+                  # For invalid outside-workspace references, still avoid rewriting
+                  # the original path into ../ style. The failure reason explains it.
+                  return resolved.as_posix()
 
           for package, item in sorted(crates.items()):
               source_pkg_dir = Path(item["source"]).resolve()
@@ -480,6 +497,11 @@ jobs:
 
                           references.append(reference)
 
+                          if not is_under(target_resolved, workspace_root):
+                              reference["reason"] = "resolved generated path is outside the generated workspace"
+                              outside_workspace.append(reference)
+                              continue
+
                           if not is_under(source_resolved, source_root):
                               reference["reason"] = "resolved source path is outside the gpui-component checkout"
                               outside_source.append(reference)
@@ -509,7 +531,7 @@ jobs:
                       item["reason"] = "target path does not exist after resource import"
                       missing_after_copy.append(item)
 
-          failures = outside_source + source_missing + missing + missing_after_copy
+          failures = outside_workspace + outside_source + source_missing + missing + missing_after_copy
 
           def markdown_cell(value) -> str:
               text = str(value)
@@ -517,6 +539,7 @@ jobs:
 
           def write_rows(summary, rows, limit=80):
               for row in rows[:limit]:
+                  generated_path = generated_path_for_summary(row.get("target_resolved", "")) if row.get("target_resolved") else ""
                   summary.write(
                       "| "
                       + markdown_cell(row.get("package", ""))
@@ -527,7 +550,7 @@ jobs:
                       + " | `"
                       + markdown_cell(row.get("path", ""))
                       + "` | `"
-                      + markdown_cell(row.get("target_resolved", ""))
+                      + markdown_cell(generated_path)
                       + "` | "
                       + markdown_cell(row.get("reason", ""))
                       + " |\n"
@@ -547,7 +570,7 @@ jobs:
 
                   if imported:
                       summary.write("#### Source resources imported automatically\n\n")
-                      summary.write("| Package | Rust file | Line | Relative path | Generated target path | Reason |\n")
+                      summary.write("| Package | Rust file | Line | Relative path | Generated path | Reason |\n")
                       summary.write("|---|---|---:|---|---|---|\n")
                       rows = []
                       for row in imported:
@@ -562,7 +585,7 @@ jobs:
                       summary.write(
                           "These paths are intentionally ignored because they point to files/folders under `node_modules`.\n\n"
                       )
-                      summary.write("| Package | Rust file | Line | Relative path | Generated target path | Reason |\n")
+                      summary.write("| Package | Rust file | Line | Relative path | Generated path | Reason |\n")
                       summary.write("|---|---|---:|---|---|---|\n")
                       write_rows(summary, ignored_node_modules)
                       summary.write("\n")
@@ -573,18 +596,29 @@ jobs:
                           "These paths were referenced from imported Rust files but were not found in the generated workspace. "
                           "References under `node_modules` are excluded from this failure list.\n\n"
                       )
-                      summary.write("| Package | Rust file | Line | Relative path | Generated target path | Reason |\n")
+                      summary.write("| Package | Rust file | Line | Relative path | Generated path | Reason |\n")
                       summary.write("|---|---|---:|---|---|---|\n")
                       write_rows(summary, failures)
                   else:
                       summary.write("All checked relative path resources resolve in the generated workspace.\n")
+
+          imported_resource_paths = sorted({
+              generated_path_for_summary(row["target_resolved"])
+              for row in imported
+              if row.get("target_resolved")
+          })
+
+          github_output = os.environ.get("GITHUB_OUTPUT")
+          if github_output:
+              with Path(github_output).open("a") as output:
+                  output.write(f"imported_resource_paths_json={json.dumps(imported_resource_paths)}\n")
 
           print(
               f"Relative path resource validation: scanned {scanned_rs_files} Rust files, "
               f"skipped {skipped_node_modules_rs_files} node_modules Rust files, "
               f"found {len(references)} checked references, "
               f"ignored {len(ignored_node_modules)} node_modules references, "
-              f"imported {len(imported)} resources, failures {len(failures)}."
+              f"imported {len(imported_resource_paths)} resource path(s), failures {len(failures)}."
           )
 
           if failures:
@@ -2451,6 +2485,7 @@ jobs:
         id: generated_commit
         env:
           IMPORTED_PATHS_JSON: ${{ steps.detect.outputs.imported_paths_json }}
+          IMPORTED_RESOURCE_PATHS_JSON: ${{ steps.resource_validation.outputs.imported_resource_paths_json }}
         shell: bash
         run: |
           set -euo pipefail
@@ -2463,9 +2498,26 @@ jobs:
           PY
           )
 
+          mapfile -t IMPORTED_RESOURCE_PATHS < <(python - <<'PY'
+          import json
+          import os
+          raw = os.environ.get("IMPORTED_RESOURCE_PATHS_JSON") or "[]"
+          for path in json.loads(raw):
+              print(path)
+          PY
+          )
+
           git add Cargo.toml
           for path in "${IMPORTED_PATHS[@]}"; do
             git add "$path"
+          done
+          for path in "${IMPORTED_RESOURCE_PATHS[@]}"; do
+            if [[ -e "$path" ]]; then
+              git add -f -- "$path"
+            else
+              echo "Imported resource path is missing before commit: $path" >&2
+              exit 1
+            fi
           done
 
           if git diff --cached --quiet; then
