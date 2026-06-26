@@ -305,45 +305,258 @@ jobs:
 
               print(f"Imported {package}: {source} -> {target}")
 
-      - name: Import source support files used by compile-time includes
+      - name: Import and validate relative path resources used by Rust files
+        env:
+          CRATES_JSON: ${{ steps.detect.outputs.crates_json }}
         shell: python
         run: |
           from pathlib import Path
+          import json
+          import os
+          import re
           import shutil
 
-          source_root = Path("_gpui_component_source")
+          crates = json.loads(os.environ["CRATES_JSON"])
+          source_root = Path("_gpui_component_source").resolve()
+          workspace_root = Path.cwd().resolve()
 
-          # The package graph import copies only Cargo packages. gpui-component
-          # also references repo-root support files through compile-time
-          # include_str! paths, for example:
-          #   crates/gpui_component/src/theme -> ../../../../themes/...
-          #   crates/gpui_component_story/src/stories -> ../../../../README.md
-          # Copy those non-package support paths explicitly so the generated
-          # repository layout matches the source repository where the macros
-          # and examples were authored.
-          support_paths = [
-              "themes",
-              "README.md",
-          ]
+          # User-requested resource pre-filter. We keep this exact line-level
+          # search broad, then extract concrete relative path tokens below.
+          line_pattern = re.compile(r".*\.\./[-.\w]+.*")
+          relative_path_pattern = re.compile(
+              r"(?<![A-Za-z0-9_])((?:\.\./)+(?:[-.\w]+/)*[-.\w]+/?)"
+          )
 
-          for rel in support_paths:
-              source = source_root / rel
-              target = Path(rel)
-              if not source.exists():
-                  print(f"Source support path not found, skipping: {source}")
-                  continue
+          ignored_dirs = {
+              ".git",
+              "target",
+              ".claude",
+              ".codex",
+              "__MACOSX",
+          }
+          ignored_names = {
+              ".DS_Store",
+              "Thumbs.db",
+              "desktop.ini",
+              "AGENTS.md",
+              "CLAUDE.md",
+              "GEMINI.md",
+          }
 
+          def is_under(path: Path, root: Path) -> bool:
+              try:
+                  path.resolve().relative_to(root.resolve())
+                  return True
+              except ValueError:
+                  return False
+
+          def copy_resource(source: Path, target: Path) -> None:
               if source.is_dir():
                   if target.exists():
-                      shutil.rmtree(target)
-                  shutil.copytree(source, target, ignore=shutil.ignore_patterns(".git", "target", ".DS_Store", "__MACOSX", "__MACOSX", "Thumbs.db", "desktop.ini", ".claude", ".codex", "AGENTS.md", "CLAUDE.md", "GEMINI.md"))
-                  print(f"Imported source support directory {source} -> {target}")
-              else:
+                      if target.is_dir():
+                          shutil.rmtree(target)
+                      else:
+                          target.unlink()
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copytree(
+                      source,
+                      target,
+                      ignore=shutil.ignore_patterns(
+                          ".git",
+                          "target",
+                          ".DS_Store",
+                          "__MACOSX",
+                          "Thumbs.db",
+                          "desktop.ini",
+                          ".claude",
+                          ".codex",
+                          "AGENTS.md",
+                          "CLAUDE.md",
+                          "GEMINI.md",
+                      ),
+                  )
+              elif source.is_file():
                   target.parent.mkdir(parents=True, exist_ok=True)
                   if target.exists() and target.is_dir():
                       shutil.rmtree(target)
                   shutil.copy2(source, target)
-                  print(f"Imported source support file {source} -> {target}")
+              else:
+                  raise FileNotFoundError(source)
+
+          references = []
+          imported = []
+          missing = []
+          source_missing = []
+          outside_source = []
+          scanned_rs_files = 0
+
+          for package, item in sorted(crates.items()):
+              source_pkg_dir = Path(item["source"]).resolve()
+              target_pkg_dir = Path(item["target"]).resolve()
+
+              if not source_pkg_dir.exists():
+                  source_missing.append({
+                      "package": package,
+                      "file": str(Path(item["source"])),
+                      "line": 0,
+                      "path": ".",
+                      "source_resolved": str(source_pkg_dir),
+                      "target_resolved": str(target_pkg_dir),
+                      "reason": "imported package source directory is missing",
+                  })
+                  continue
+
+              for source_rs in sorted(source_pkg_dir.rglob("*.rs")):
+                  if any(part in ignored_dirs for part in source_rs.relative_to(source_pkg_dir).parts):
+                      continue
+                  scanned_rs_files += 1
+
+                  try:
+                      rel_rs = source_rs.relative_to(source_pkg_dir)
+                  except ValueError:
+                      continue
+
+                  target_rs = target_pkg_dir / rel_rs
+                  if not target_rs.exists():
+                      # This should not normally happen because the package was copied
+                      # first. Report it as a target-side missing resource so the run
+                      # fails with a useful summary instead of hiding an over-exclusion.
+                      missing.append({
+                          "package": package,
+                          "file": str(Path(item["target"]) / rel_rs),
+                          "line": 0,
+                          "path": str(rel_rs),
+                          "source_resolved": str(source_rs),
+                          "target_resolved": str(target_rs),
+                          "reason": "Rust source file was not copied into the generated workspace",
+                      })
+                      continue
+
+                  try:
+                      lines = source_rs.read_text(encoding="utf-8").splitlines()
+                  except UnicodeDecodeError:
+                      lines = source_rs.read_text(errors="replace").splitlines()
+
+                  for lineno, line in enumerate(lines, 1):
+                      if not line_pattern.search(line):
+                          continue
+
+                      rel_paths = sorted(set(relative_path_pattern.findall(line)))
+                      if not rel_paths:
+                          continue
+
+                      for rel_path_text in rel_paths:
+                          source_resolved = (source_rs.parent / rel_path_text).resolve()
+                          target_resolved = (target_rs.parent / rel_path_text).resolve()
+
+                          reference = {
+                              "package": package,
+                              "file": str(Path(item["target"]) / rel_rs),
+                              "line": lineno,
+                              "path": rel_path_text,
+                              "source_resolved": str(source_resolved),
+                              "target_resolved": str(target_resolved),
+                              "line_text": line.strip(),
+                          }
+                          references.append(reference)
+
+                          if not is_under(source_resolved, source_root):
+                              reference["reason"] = "resolved source path is outside the gpui-component checkout"
+                              outside_source.append(reference)
+                              continue
+
+                          if target_resolved.exists():
+                              continue
+
+                          if not source_resolved.exists():
+                              reference["reason"] = "resolved source path does not exist in the gpui-component checkout"
+                              source_missing.append(reference)
+                              continue
+
+                          copy_resource(source_resolved, target_resolved)
+                          if target_resolved.exists():
+                              imported.append(reference)
+                          else:
+                              reference["reason"] = "copy completed but target path is still missing"
+                              missing.append(reference)
+
+          missing_after_copy = []
+          for reference in references:
+              target_resolved = Path(reference["target_resolved"])
+              if not target_resolved.exists():
+                  if reference not in source_missing and reference not in outside_source and reference not in missing:
+                      item = dict(reference)
+                      item["reason"] = "target path does not exist after resource import"
+                      missing_after_copy.append(item)
+
+          failures = outside_source + source_missing + missing + missing_after_copy
+
+          def markdown_cell(value) -> str:
+              text = str(value)
+              return text.replace("|", "\\|").replace("\n", "<br>")
+
+          def write_rows(summary, rows, limit=80):
+              for row in rows[:limit]:
+                  summary.write(
+                      "| "
+                      + markdown_cell(row.get("package", ""))
+                      + " | `"
+                      + markdown_cell(row.get("file", ""))
+                      + "` | "
+                      + markdown_cell(row.get("line", ""))
+                      + " | `"
+                      + markdown_cell(row.get("path", ""))
+                      + "` | `"
+                      + markdown_cell(row.get("target_resolved", ""))
+                      + "` | "
+                      + markdown_cell(row.get("reason", ""))
+                      + " |\n"
+                  )
+              if len(rows) > limit:
+                  summary.write(f"\nOnly the first {limit} rows are shown out of {len(rows)}.\n")
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              with Path(summary_path).open("a") as summary:
+                  summary.write("\n### Relative path resource validation\n")
+                  summary.write(
+                      f"Scanned `{scanned_rs_files}` Rust source files from `{len(crates)}` imported package(s) "
+                      f"for line pattern `.*\\.\\./[-.\\w]+.*`.\n\n"
+                  )
+                  summary.write(f"Found `{len(references)}` relative path reference(s).\n\n")
+
+                  if imported:
+                      summary.write("#### Source resources imported automatically\n\n")
+                      summary.write("| Package | Rust file | Line | Relative path | Generated target path | Reason |\n")
+                      summary.write("|---|---|---:|---|---|---|\n")
+                      rows = []
+                      for row in imported:
+                          imported_row = dict(row)
+                          imported_row["reason"] = "copied from gpui-component source checkout"
+                          rows.append(imported_row)
+                      write_rows(summary, rows)
+                      summary.write("\n")
+
+                  if failures:
+                      summary.write("#### Missing relative path resources\n\n")
+                      summary.write("These paths were referenced from imported Rust files but were not found in the generated workspace.\n\n")
+                      summary.write("| Package | Rust file | Line | Relative path | Generated target path | Reason |\n")
+                      summary.write("|---|---|---:|---|---|---|\n")
+                      write_rows(summary, failures)
+                  else:
+                      summary.write("All extracted relative path resources resolve in the generated workspace.\n")
+
+          print(
+              f"Relative path resource validation: scanned {scanned_rs_files} Rust files, "
+              f"found {len(references)} references, imported {len(imported)} resources, "
+              f"failures {len(failures)}."
+          )
+
+          if failures:
+              raise SystemExit(
+                  "Missing relative path resources referenced by imported gpui-component Rust files. "
+                  "See the GitHub workflow summary for details."
+              )
 
       - name: Patch root workspace Cargo.toml
         env:
@@ -2133,6 +2346,7 @@ jobs:
             echo
             echo "Validated generated branch with:"
             echo "- cargo metadata --no-deps --format-version=1"
+            echo "- relative path resource scan/import validation for imported Rust files"
             echo "- cargo check for imported packages plus gpui_facade only"
             echo
             echo "Checked packages:"
