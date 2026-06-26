@@ -1495,40 +1495,41 @@ jobs:
                           )
                           continue
 
-                      extra_features = missing_workspace_features(source_entry, target_entry)
-                      if extra_features:
-                          text, replaced = rewrite_workspace_dependency_entries(
-                              text,
-                              dep_name,
-                              lambda original_entry, dep_name=dep_name, extra_features=extra_features:
-                                  inherited_dependency_line(dep_name, original_entry, extra_features),
-                          )
-                          if replaced:
-                              record_alignment(
-                                  dep_name,
-                                  source_entry,
-                                  target_entry,
-                                  cargo_toml,
-                                  "aligned to target root; member adds missing features " + ", ".join(extra_features),
+                      source_value = dependency_table(source_entry)
+                      target_value = dependency_table(target_entry)
+                      target_features = feature_set(target_value)
+                      inherited_extra_feature_rows = []
+
+                      def workspace_inherit_rewriter(original_entry, dep_name=dep_name, source_value=source_value, target_features=target_features):
+                          original_value = dependency_entry_table(original_entry, dep_name)
+                          required_extra_features = [
+                              feature
+                              for feature in merge_ordered_features(
+                                  ordered_features(source_value),
+                                  ordered_features(original_value),
                               )
-                      else:
-                          probe_text, replaced = rewrite_workspace_dependency_entries(
-                              text,
+                              if feature not in target_features
+                          ]
+                          inherited_extra_feature_rows.append(required_extra_features)
+                          return inherited_dependency_line(dep_name, original_entry, required_extra_features)
+
+                      text, replaced = rewrite_workspace_dependency_entries(
+                          text,
+                          dep_name,
+                          workspace_inherit_rewriter,
+                      )
+                      if replaced:
+                          extra_features = merge_ordered_features(*inherited_extra_feature_rows)
+                          result = "aligned to target root workspace dependency"
+                          if extra_features:
+                              result += "; member adds or keeps missing features " + ", ".join(extra_features)
+                          record_alignment(
                               dep_name,
-                              lambda original_entry: original_entry,
+                              source_entry,
+                              target_entry,
+                              cargo_toml,
+                              result,
                           )
-                          # The identity rewrite above is intentionally a no-op; it lets us
-                          # report source/root version discrepancies only for dependencies
-                          # that this imported manifest actually inherits.
-                          text = probe_text
-                          if replaced:
-                              record_alignment(
-                                  dep_name,
-                                  source_entry,
-                                  target_entry,
-                                  cargo_toml,
-                                  "aligned to target root workspace dependency",
-                              )
 
                   # Convert direct external dependencies to workspace inheritance only
                   # after the root has been raised to the highest compatible imported
@@ -1548,12 +1549,17 @@ jobs:
                           indent_match = re.match(r'^(\s*)', original_entry)
                           indent = indent_match.group(1) if indent_match else ""
                           line = render_dependency_line(dep_name, inherited, indent)
+                          result = "direct member dependency converted to workspace inheritance"
+                          if inherited.get("features"):
+                              result += "; member adds missing features " + ", ".join(inherited["features"])
+                          if inherited.get("optional") is True:
+                              result += "; optional=true preserved"
                           record_alignment(
                               dep_name,
                               original_entry,
                               target_entry,
                               cargo_toml,
-                              "direct member dependency converted to workspace inheritance",
+                              result,
                           )
                           return line
 
@@ -1571,8 +1577,12 @@ jobs:
                       "Imported crates inherit the generated root `[workspace.dependencies]` "
                       "when it is semantically safe. For ordinary registry dependencies, "
                       "the root version is first raised to the highest Cargo-compatible "
-                      "imported lower bound; unsafe path/git/default-features/version-lane "
-                      "mismatches are expanded locally instead.\n\n"
+                      "imported lower bound. Dependency `features` are additive: root "
+                      "features are preserved, and member-only/source-only missing features "
+                      "stay on the member dependency as `features = [...]`. Package aliases, "
+                      "path/git/custom registry identity, `default-features`, and incompatible "
+                      "version lanes are not merged silently; those dependencies are expanded "
+                      "or left explicit and reported below.\n\n"
                   )
                   if version_update_reports:
                       summary.write("#### Root workspace dependency version updates\n\n")
