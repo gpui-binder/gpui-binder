@@ -545,7 +545,33 @@ jobs:
       - name: Sparse clone upstream, validate, and create generated branch
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+
+          CURRENT_STAGE="initializing"
+
+          append_failure_summary() {
+            local status="${1:-unknown}"
+            local line="${2:-unknown}"
+
+            if [ -z "${GITHUB_STEP_SUMMARY:-}" ]; then
+              return 0
+            fi
+
+            {
+              echo "## fork-gpui failed"
+              echo ""
+              echo "- Stage: \`${CURRENT_STAGE:-unknown}\`"
+              echo "- Exit status: \`${status}\`"
+              echo "- Bash line: \`${line}\`"
+              echo "- Upstream repo: \`${UPSTREAM_REPO_INPUT:-unknown}\`"
+              echo "- Upstream branch/ref: \`${UPSTREAM_BRANCH_INPUT:-unknown}\`"
+              echo ""
+              echo "Check the failed step log above for command output. If the failure came from gpui_facade feature validation, the detailed feature report should appear above this section."
+              echo ""
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          trap 'status=$?; line=$LINENO; if [ "$status" -ne 0 ]; then append_failure_summary "$status" "$line"; fi' ERR
 
           git config --global init.defaultBranch main
           git config --global user.name "github-actions[bot]"
@@ -823,12 +849,15 @@ jobs:
 
             python3 - "$metadata_file" "$path" <<'PY'
           from pathlib import Path
+          import json
           import os
           import re
           import sys
+          import tomllib
 
           metadata_file = Path(sys.argv[1])
           dst = Path(sys.argv[2])
+          gpui_manifest = Path("crates/gpui/Cargo.toml")
 
           template = os.environ["FILE__CRATES_GPUI_FACADE_CARGO_TOML"]
           metadata = metadata_file.read_text().rstrip()
@@ -841,7 +870,187 @@ jobs:
                   "Unresolved placeholders: " + ", ".join(sorted(set(missing)))
               )
 
-          dst.write_text(output.rstrip() + "\n")
+          if not gpui_manifest.exists():
+              raise SystemExit("Missing crates/gpui/Cargo.toml while generating gpui_facade")
+
+          def read_toml(path: Path):
+              return tomllib.loads(path.read_text(encoding="utf-8"))
+
+          def section_body(text: str, section: str) -> tuple[int, int, str]:
+              match = re.search(rf"(?ms)^\[{re.escape(section)}\]\s*(.*?)(?=^\[|\Z)", text)
+              if not match:
+                  raise SystemExit(f"Could not find [{section}] section")
+              return match.start(1), match.end(1), match.group(1)
+
+          def feature_key_order(text: str, section: str = "features") -> list[str]:
+              try:
+                  _, _, body = section_body(text, section)
+              except SystemExit:
+                  return []
+
+              order = []
+              seen = set()
+              for line in body.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("#") or "=" not in stripped:
+                      continue
+
+                  key = stripped.split("=", 1)[0].strip()
+                  if key.startswith('"') and key.endswith('"'):
+                      try:
+                          key = json.loads(key)
+                      except Exception:
+                          key = key.strip('"')
+
+                  if key and key not in seen:
+                      order.append(key)
+                      seen.add(key)
+              return order
+
+          def iter_dependency_tables(data):
+              for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+                  table = data.get(section, {})
+                  if isinstance(table, dict):
+                      yield table
+
+              target = data.get("target", {})
+              if isinstance(target, dict):
+                  for target_table in target.values():
+                      if not isinstance(target_table, dict):
+                          continue
+                      for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+                          table = target_table.get(section, {})
+                          if isinstance(table, dict):
+                              yield table
+
+          def explicit_dep_colon_refs(features: dict) -> set[str]:
+              refs = set()
+              for values in features.values():
+                  if not isinstance(values, list):
+                      continue
+                  for value in values:
+                      if isinstance(value, str) and value.startswith("dep:"):
+                          refs.add(value[4:])
+              return refs
+
+          def package_feature_map(path: Path) -> tuple[dict[str, list[str]], list[str]]:
+              text = path.read_text(encoding="utf-8")
+              data = tomllib.loads(text)
+              explicit = data.get("features", {})
+              if not isinstance(explicit, dict):
+                  explicit = {}
+
+              features = {name: list(values) for name, values in explicit.items() if isinstance(values, list)}
+              order = feature_key_order(text)
+              seen = set(order)
+
+              hidden_optional_deps = explicit_dep_colon_refs(features)
+              for table in iter_dependency_tables(data):
+                  for dep_name, dep_value in table.items():
+                      if not isinstance(dep_value, dict) or dep_value.get("optional") is not True:
+                          continue
+                      if dep_name in hidden_optional_deps:
+                          continue
+                      if dep_name not in features:
+                          features[dep_name] = []
+                      if dep_name not in seen:
+                          order.append(dep_name)
+                          seen.add(dep_name)
+
+              return features, order
+
+          def unique(values: list[str]) -> list[str]:
+              seen = set()
+              result = []
+              for value in values:
+                  if value in seen:
+                      continue
+                  seen.add(value)
+                  result.append(value)
+              return result
+
+          def toml_key(key: str) -> str:
+              if re.fullmatch(r"[A-Za-z0-9_-]+", key):
+                  return key
+              return json.dumps(key)
+
+          def format_feature_value(values: list[str]) -> str:
+              values = unique(values)
+              if not values:
+                  return "[]"
+              if len(values) == 1:
+                  return "[" + json.dumps(values[0]) + "]"
+              lines = ["["]
+              for value in values:
+                  lines.append(f"    {json.dumps(value)},")
+              lines.append("]")
+              return "\n".join(lines)
+
+          def replace_features_section(text: str, features: dict[str, list[str]], order: list[str]) -> str:
+              body_start, body_end, _ = section_body(text, "features")
+
+              seen = set()
+              final_order = []
+              for key in order:
+                  if key in features and key not in seen:
+                      final_order.append(key)
+                      seen.add(key)
+              for key in features:
+                  if key not in seen:
+                      final_order.append(key)
+                      seen.add(key)
+
+              body = ""
+              for key in final_order:
+                  body += f"{toml_key(key)} = {format_feature_value(features[key])}\n"
+
+              return text[:body_start] + body + text[body_end:]
+
+          gpui_features, gpui_feature_order = package_feature_map(gpui_manifest)
+
+          facade_data = tomllib.loads(output)
+          facade_features = facade_data.get("features", {})
+          if not isinstance(facade_features, dict):
+              raise SystemExit("Generated gpui_facade Cargo.toml has no [features] table")
+          facade_features = {
+              name: list(values)
+              for name, values in facade_features.items()
+              if isinstance(values, list)
+          }
+          facade_order = feature_key_order(output)
+
+          added_features = []
+          amended_features = []
+
+          for name in gpui_feature_order:
+              if name not in gpui_features:
+                  continue
+
+              mirror_ref = f"gpui/{name}"
+
+              if name not in facade_features:
+                  facade_features[name] = [mirror_ref]
+                  facade_order.append(name)
+                  added_features.append(name)
+                  continue
+
+              if mirror_ref not in facade_features[name]:
+                  facade_features[name] = [mirror_ref] + facade_features[name]
+                  amended_features.append(name)
+
+          output = replace_features_section(output, facade_features, facade_order)
+
+          dst.write_text(output.rstrip() + "\n", encoding="utf-8")
+
+          print("gpui_facade feature mirror generation completed")
+          if added_features:
+              print("Added missing gpui passthrough features:")
+              for name in added_features:
+                  print(f"  - {name}")
+          if amended_features:
+              print("Amended existing gpui_facade features to forward to gpui:")
+              for name in amended_features:
+                  print(f"  - {name}")
           PY
           }
 
@@ -1224,6 +1433,335 @@ jobs:
           PY
           }
 
+          validate_gpui_facade_features() {
+            echo "Validating gpui_facade feature mirror and feature references"
+
+            cd "$OUT_DIR"
+
+            python3 - "${GITHUB_STEP_SUMMARY:-}" <<'PY'
+          from pathlib import Path
+          import json
+          import re
+          import sys
+          import tomllib
+
+          summary_arg = sys.argv[1] if len(sys.argv) > 1 else ""
+          summary_path = Path(summary_arg) if summary_arg else None
+          root = Path.cwd().resolve()
+          root_manifest = root / "Cargo.toml"
+          gpui_manifest = root / "crates/gpui/Cargo.toml"
+          facade_manifest = root / "crates/gpui_facade/Cargo.toml"
+
+          errors = []
+          warnings = []
+          details = []
+
+          def add_error(message: str):
+              errors.append(message)
+              print(f"ERROR: {message}")
+
+          def add_warning(message: str):
+              warnings.append(message)
+              print(f"WARNING: {message}")
+
+          def read_toml(path: Path):
+              if not path.exists():
+                  add_error(f"Missing required manifest: {path.relative_to(root) if path.is_relative_to(root) else path}")
+                  return {}
+              try:
+                  return tomllib.loads(path.read_text(encoding="utf-8"))
+              except Exception as exc:
+                  add_error(f"Could not parse {path}: {exc}")
+                  return {}
+
+          def section_body(text: str, section: str) -> str:
+              match = re.search(rf"(?ms)^\[{re.escape(section)}\]\s*(.*?)(?=^\[|\Z)", text)
+              return match.group(1) if match else ""
+
+          def feature_key_order(path: Path) -> list[str]:
+              if not path.exists():
+                  return []
+              body = section_body(path.read_text(encoding="utf-8"), "features")
+              order = []
+              seen = set()
+              for line in body.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("#") or "=" not in stripped:
+                      continue
+                  key = stripped.split("=", 1)[0].strip()
+                  if key.startswith('"') and key.endswith('"'):
+                      try:
+                          key = json.loads(key)
+                      except Exception:
+                          key = key.strip('"')
+                  if key and key not in seen:
+                      order.append(key)
+                      seen.add(key)
+              return order
+
+          def iter_dependency_tables(data):
+              for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+                  table = data.get(section, {})
+                  if isinstance(table, dict):
+                      yield section, table
+
+              target = data.get("target", {})
+              if isinstance(target, dict):
+                  for target_name, target_table in target.items():
+                      if not isinstance(target_table, dict):
+                          continue
+                      for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+                          table = target_table.get(section, {})
+                          if isinstance(table, dict):
+                              yield f"target.{target_name}.{section}", table
+
+          def dep_colon_refs(features: dict[str, list[str]]) -> set[str]:
+              refs = set()
+              for values in features.values():
+                  if not isinstance(values, list):
+                      continue
+                  for value in values:
+                      if isinstance(value, str) and value.startswith("dep:"):
+                          refs.add(value[4:])
+              return refs
+
+          def package_features(path: Path) -> tuple[dict[str, list[str]], list[str]]:
+              data = read_toml(path)
+              explicit = data.get("features", {})
+              if not isinstance(explicit, dict):
+                  explicit = {}
+
+              features = {name: list(values) for name, values in explicit.items() if isinstance(values, list)}
+              order = feature_key_order(path)
+              seen = set(order)
+              hidden_optional_deps = dep_colon_refs(features)
+
+              for _, table in iter_dependency_tables(data):
+                  for dep_name, dep_value in table.items():
+                      if isinstance(dep_value, dict) and dep_value.get("optional") is True:
+                          if dep_name in hidden_optional_deps:
+                              continue
+                          if dep_name not in features:
+                              features[dep_name] = []
+                          if dep_name not in seen:
+                              order.append(dep_name)
+                              seen.add(dep_name)
+
+              return features, order
+
+          root_data = read_toml(root_manifest)
+          gpui_features, gpui_order = package_features(gpui_manifest)
+          facade_data = read_toml(facade_manifest)
+          facade_features, facade_order = package_features(facade_manifest)
+
+          workspace_deps = root_data.get("workspace", {}).get("dependencies", {})
+          if not isinstance(workspace_deps, dict):
+              workspace_deps = {}
+
+          facade_dependency_entries = {}
+          for section_name, table in iter_dependency_tables(facade_data):
+              for dep_name, dep_value in table.items():
+                  entry = facade_dependency_entries.setdefault(
+                      dep_name,
+                      {"values": [], "sections": [], "optional": False},
+                  )
+                  entry["values"].append(dep_value)
+                  entry["sections"].append(section_name)
+                  if isinstance(dep_value, dict) and dep_value.get("optional") is True:
+                      entry["optional"] = True
+
+          def dep_manifest(dep_name: str) -> Path | None:
+              entry = facade_dependency_entries.get(dep_name)
+              if not entry:
+                  return None
+
+              for dep_value in entry["values"]:
+                  value = dep_value
+                  base = facade_manifest.parent
+
+                  if isinstance(value, dict) and value.get("workspace") is True:
+                      workspace_value = workspace_deps.get(dep_name)
+                      if not isinstance(workspace_value, dict):
+                          continue
+                      value = workspace_value
+                      base = root
+
+                  if isinstance(value, dict) and isinstance(value.get("path"), str):
+                      candidate = (base / value["path"] / "Cargo.toml").resolve()
+                      if candidate.exists():
+                          return candidate
+
+              return None
+
+          dependency_feature_cache = {}
+          def dependency_feature_set(dep_name: str) -> set[str] | None:
+              if dep_name in dependency_feature_cache:
+                  return dependency_feature_cache[dep_name]
+
+              manifest = dep_manifest(dep_name)
+              if manifest is None:
+                  dependency_feature_cache[dep_name] = None
+                  return None
+
+              features, _ = package_features(manifest)
+              feature_set = set(features)
+              dependency_feature_cache[dep_name] = feature_set
+              return feature_set
+
+          # 1. gpui_facade must accept every feature that the underlying gpui
+          # package accepts, including implicit features created by non-hidden
+          # optional dependencies. This prevents downstream users from failing
+          # when they replace package = "gpui" with package = "gpui_facade".
+          missing_mirrors = []
+          incomplete_mirrors = []
+
+          for feature_name in gpui_order:
+              if feature_name not in gpui_features:
+                  continue
+
+              mirror_ref = f"gpui/{feature_name}"
+              if feature_name not in facade_features:
+                  missing_mirrors.append(feature_name)
+              elif mirror_ref not in facade_features[feature_name]:
+                  incomplete_mirrors.append((feature_name, mirror_ref))
+
+          if missing_mirrors:
+              add_error(
+                  "gpui_facade is missing feature mirror definitions for: "
+                  + ", ".join(sorted(missing_mirrors))
+              )
+
+          if incomplete_mirrors:
+              add_error(
+                  "gpui_facade has feature names that exist in gpui but do not forward to gpui/<feature>: "
+                  + ", ".join(f"{name} should include {ref}" for name, ref in sorted(incomplete_mirrors))
+              )
+
+          # 2. Every feature reference written in gpui_facade must be resolvable.
+          # This catches target-only paths that a plain cargo check on Linux may
+          # not exercise, such as macOS-only or Windows-only package features.
+          bad_refs = []
+
+          def is_known_local_feature(name: str) -> bool:
+              return name in facade_features
+
+          for feature_name in facade_order:
+              values = facade_features.get(feature_name, [])
+              if not isinstance(values, list):
+                  bad_refs.append((feature_name, "<non-list>", "feature value is not an array"))
+                  continue
+
+              for value in values:
+                  if not isinstance(value, str):
+                      bad_refs.append((feature_name, repr(value), "feature item is not a string"))
+                      continue
+
+                  if value.startswith("dep:"):
+                      dep_name = value[4:]
+                      dep_entry = facade_dependency_entries.get(dep_name)
+                      if dep_entry is None:
+                          bad_refs.append((feature_name, value, "dep: reference points to a dependency that is not declared"))
+                      elif dep_entry.get("optional") is not True:
+                          bad_refs.append((feature_name, value, "dep: reference points to a non-optional dependency"))
+                      continue
+
+                  if "/" in value:
+                      dep_part, dep_feature = value.split("/", 1)
+                      weak = dep_part.endswith("?")
+                      dep_name = dep_part[:-1] if weak else dep_part
+                      dep_entry = facade_dependency_entries.get(dep_name)
+
+                      if dep_entry is None:
+                          bad_refs.append((feature_name, value, "dependency feature reference points to an undeclared dependency"))
+                          continue
+
+                      if weak and dep_entry.get("optional") is not True:
+                          bad_refs.append((feature_name, value, "weak dependency feature reference uses ? on a non-optional dependency"))
+
+                      known_dep_features = dependency_feature_set(dep_name)
+                      if known_dep_features is not None and dep_feature != "default" and dep_feature not in known_dep_features:
+                          manifest = dep_manifest(dep_name)
+                          manifest_rel = manifest.relative_to(root) if manifest and manifest.is_relative_to(root) else manifest
+                          bad_refs.append(
+                              (
+                                  feature_name,
+                                  value,
+                                  f"dependency feature is not defined in {manifest_rel}",
+                              )
+                          )
+                      continue
+
+                  if not is_known_local_feature(value):
+                      bad_refs.append((feature_name, value, "local feature reference is not defined in gpui_facade"))
+
+          if bad_refs:
+              for feature_name, value, reason in bad_refs:
+                  add_error(f"Invalid gpui_facade feature reference in {feature_name}: {value} ({reason})")
+
+          details.append(f"Mirrored gpui features checked: {len(gpui_order)}")
+          details.append(f"gpui_facade features checked: {len(facade_order)}")
+          details.append(f"Declared gpui_facade dependency keys checked: {len(facade_dependency_entries)}")
+
+          def md_escape(text: str) -> str:
+              return text.replace("|", "\\|")
+
+          def write_summary():
+              if summary_path is None:
+                  return
+
+              lines = []
+              lines.append("## gpui_facade feature validation")
+              lines.append("")
+              lines.append(f"- Result: {'failed' if errors else 'passed'}")
+              for detail in details:
+                  lines.append(f"- {detail}")
+              lines.append("")
+
+              if missing_mirrors:
+                  lines.append("### Missing mirrored features")
+                  lines.append("")
+                  for name in sorted(missing_mirrors):
+                      lines.append(f"- `{name}` should be added as `{name} = [\"gpui/{name}\"]`")
+                  lines.append("")
+
+              if incomplete_mirrors:
+                  lines.append("### Incomplete mirrored features")
+                  lines.append("")
+                  for name, ref in sorted(incomplete_mirrors):
+                      lines.append(f"- `{name}` should include `{ref}`")
+                  lines.append("")
+
+              if bad_refs:
+                  lines.append("### Invalid feature references")
+                  lines.append("")
+                  lines.append("| facade feature | reference | problem |")
+                  lines.append("| --- | --- | --- |")
+                  for feature_name, value, reason in bad_refs:
+                      lines.append(f"| `{md_escape(feature_name)}` | `{md_escape(str(value))}` | {md_escape(str(reason))} |")
+                  lines.append("")
+
+              if warnings:
+                  lines.append("### Warnings")
+                  lines.append("")
+                  for warning in warnings:
+                      lines.append(f"- {warning}")
+                  lines.append("")
+
+              summary_path.parent.mkdir(parents=True, exist_ok=True)
+              with summary_path.open("a", encoding="utf-8") as f:
+                  f.write("\n".join(lines).rstrip() + "\n\n")
+
+          write_summary()
+
+          if errors:
+              raise SystemExit("gpui_facade feature validation failed; see GitHub workflow summary for details")
+
+          print("gpui_facade feature validation passed")
+          for detail in details:
+              print(f"  - {detail}")
+          PY
+          }
+
           validate_cargo_metadata() {
             echo "Validating every workspace package before creating output branch"
 
@@ -1337,20 +1875,26 @@ jobs:
             echo "All workspace package metadata and cargo check validation passed"
           }
 
+          CURRENT_STAGE="capture gpui package metadata"
           GPUI_METADATA_FILE="$(capture_gpui_package_metadata)"
 
+          CURRENT_STAGE="prepare sparse output"
           copy_sparse_source_to_output
 
+          CURRENT_STAGE="capture upstream file dates"
           UPSTREAM_DATE_SNAPSHOT="$(capture_upstream_file_dates_from_git)"
           if [ ! -f "$UPSTREAM_DATE_SNAPSHOT" ]; then
             echo "Date snapshot was not created correctly: $UPSTREAM_DATE_SNAPSHOT" >&2
             exit 1
           fi
 
+          CURRENT_STAGE="remove materialized exclusions"
           remove_materialized_exclusions "$OUT_DIR"
 
+          CURRENT_STAGE="rename root README"
           rename_original_root_readme
 
+          CURRENT_STAGE="generate gpui_facade manifest"
           generate_gpui_facade_cargo_toml "$GPUI_METADATA_FILE"
 
           write_embedded_file \
@@ -1361,8 +1905,13 @@ jobs:
             "crates/gpui_facade/src/lib.rs" \
             "FILE__CRATES_GPUI_FACADE_SRC_LIB_RS"
 
+          CURRENT_STAGE="amend root Cargo.toml workspace"
           amend_root_cargo_toml_for_workspace
 
+          CURRENT_STAGE="validate gpui_facade features"
+          validate_gpui_facade_features
+
+          CURRENT_STAGE="generate FILES-BY-DATE-ZED.md"
           generate_files_by_date_markdown "$UPSTREAM_DATE_SNAPSHOT"
 
           if [ "${DEBUG_LOGS_INPUT}" = "true" ]; then
@@ -1370,8 +1919,10 @@ jobs:
             find "$OUT_DIR" -maxdepth 2 -mindepth 1 | sed "s#^$OUT_DIR/##" | sort | head -200
           fi
 
+          CURRENT_STAGE="validate cargo metadata and check"
           validate_cargo_metadata
 
+          CURRENT_STAGE="create and push generated branch"
           cd "$OUT_DIR"
 
           rm -rf .git
@@ -1426,7 +1977,27 @@ jobs:
             echo "Validation:"
             echo ""
             echo "\`\`\`text"
+            echo "gpui_facade feature mirror/reference validation"
             echo "cargo metadata --no-deps --format-version=1"
             echo "cargo check --workspace --all-targets"
             echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Failure summary
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## fork-gpui job failed"
+            echo ""
+            echo "- Upstream repo: \`${{ inputs.upstream_repo }}\`"
+            echo "- Upstream branch/ref: \`${{ inputs.upstream_branch }}\`"
+            echo "- Requested output branch: \`${{ inputs.output_branch }}\`"
+            echo ""
+            echo "Earlier summary sections may contain a more specific validation report. The most common gpui_facade-specific failures are:"
+            echo ""
+            echo "- Upstream \`gpui\` added a feature that \`gpui_facade\` did not mirror."
+            echo "- \`gpui_facade\` references a dependency feature that is not defined in the referenced package."
+            echo "- A target-specific optional dependency was renamed or removed upstream."
           } >> "$GITHUB_STEP_SUMMARY"

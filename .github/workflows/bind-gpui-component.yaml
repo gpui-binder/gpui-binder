@@ -1732,3 +1732,24 @@ jobs:
           fi
 
           git push --force-with-lease origin "HEAD:$TARGET_BRANCH"
+
+      - name: Failure summary
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## bind-gpui-component job failed"
+            echo ""
+            echo "- Zed ref: \`${{ inputs.zed_ref }}\`"
+            echo "- Source repo: \`${{ inputs.source_repo }}\`"
+            echo "- Source ref: \`${{ inputs.source_ref }}\`"
+            echo "- Source root package: \`${{ inputs.source_root_package }}\`"
+            echo "- Target branch: \`${{ inputs.target_branch }}\`"
+            echo ""
+            echo "Review the failed step log above. Common generated-manifest causes include:"
+            echo ""
+            echo "- A source dependency inherited from \`[workspace.dependencies]\` needs features that the target workspace does not provide."
+            echo "- A source dependency has the same name as a target workspace dependency but a different git/rev/package/default-features identity."
+            echo "- An imported package or local path dependency was renamed upstream and no longer matches the discovered package graph."
+          } >> "$GITHUB_STEP_SUMMARY"
