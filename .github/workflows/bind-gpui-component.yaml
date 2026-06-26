@@ -1571,84 +1571,124 @@ jobs:
 
           summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
           if summary_path:
-              with Path(summary_path).open("a") as summary:
-                  summary.write("\n### Workspace dependency version alignment\n")
-                  summary.write(
-                      "Imported crates inherit the generated root `[workspace.dependencies]` "
-                      "when it is semantically safe. For ordinary registry dependencies, "
-                      "the root version is first raised to the highest Cargo-compatible "
-                      "imported lower bound. Dependency `features` are additive: root "
-                      "features are preserved, and member-only/source-only missing features "
-                      "stay on the member dependency as `features = [...]`. Package aliases, "
-                      "path/git/custom registry identity, `default-features`, and incompatible "
-                      "version lanes are not merged silently; those dependencies are expanded "
-                      "or left explicit and reported below.\n\n"
+              def compact_action(result: str, root_changed: bool) -> str:
+                  actions = []
+                  if root_changed:
+                      actions.append("raise root")
+                  if result.startswith("direct member dependency converted to workspace inheritance"):
+                      actions.append("member -> workspace")
+                  elif result.startswith("aligned to target root workspace dependency"):
+                      actions.append("inherit root")
+                  elif result:
+                      actions.append(result)
+
+                  feature_match = re.search(
+                      r'member (?:adds or keeps missing features|adds missing features) (.+?)(?:;|$)',
+                      result,
                   )
-                  if version_update_reports:
-                      summary.write("#### Root workspace dependency version updates\n\n")
-                      summary.write("| Dependency | Imported package(s) | Generated root before | Imported requested version(s) | Generated root after | Result |\n")
-                      summary.write("|---|---|---|---|---|---|\n")
-                      for dep_name, item in sorted(version_update_reports.items()):
-                          summary.write(
-                              "| "
-                              + markdown_cell(dep_name)
-                              + " | "
-                              + markdown_cell(", ".join(item["packages"]))
-                              + " | "
-                              + markdown_cell(item["before"])
-                              + " | "
-                              + markdown_cell(item["requested"])
-                              + " | "
-                              + markdown_cell(item["after"])
-                              + " | "
-                              + markdown_cell(item["result"])
-                              + " |\n"
-                          )
-                      summary.write("\n")
+                  if feature_match:
+                      actions.append("member features: " + feature_match.group(1).strip())
+                  if "optional=true preserved" in result:
+                      actions.append("optional kept")
 
-                  if alignment_reports:
-                      summary.write("#### Member dependency alignment\n\n")
-                      summary.write("| Dependency | Imported package(s) | Source/sub-crate dependency | Generated root dependency | Result |\n")
-                      summary.write("|---|---|---|---|---|\n")
-                      for (dep_name, source_summary, target_summary, result), packages in sorted(alignment_reports.items()):
-                          summary.write(
-                              "| "
-                              + markdown_cell(dep_name)
-                              + " | "
-                              + markdown_cell(", ".join(sorted(packages)))
-                              + " | "
-                              + markdown_cell(source_summary)
-                              + " | "
-                              + markdown_cell(target_summary)
-                              + " | "
-                              + markdown_cell(result)
-                              + " |\n"
-                          )
-                  elif not version_update_reports:
-                      summary.write("No source/root workspace dependency version discrepancies required alignment.\n")
+                  compact = []
+                  seen = set()
+                  for action in actions:
+                      if action and action not in seen:
+                          compact.append(action)
+                          seen.add(action)
+                  return "; ".join(compact) if compact else "no change"
 
-                  if version_skips:
-                      summary.write("\n#### Dependency versions left explicit or unchanged\n\n")
-                      summary.write("| Dependency | Imported package | Origin | Source/sub-crate version | Generated root version | Reason |\n")
-                      summary.write("|---|---|---|---|---|---|\n")
-                      for dep_name, package, origin, source_req, target_req, reason in sorted(set(version_skips))[:80]:
+              def final_member_summary(result: str) -> str:
+                  if (
+                      result.startswith("direct member dependency converted to workspace inheritance")
+                      or result.startswith("aligned to target root workspace dependency")
+                  ):
+                      parts = ["workspace"]
+                      feature_match = re.search(
+                          r'member (?:adds or keeps missing features|adds missing features) (.+?)(?:;|$)',
+                          result,
+                      )
+                      if feature_match:
+                          parts.append("features [" + feature_match.group(1).strip() + "]")
+                      if "optional=true preserved" in result:
+                          parts.append("optional")
+                      return "; ".join(parts)
+                  return "explicit"
+
+              rows = []
+              aligned_deps = set()
+
+              for (dep_name, source_summary, target_summary, result), packages in alignment_reports.items():
+                  aligned_deps.add(dep_name)
+                  root_update = version_update_reports.get(dep_name)
+                  root_original = root_update["before"] if root_update else target_summary
+                  root_final = target_summary
+                  root_changed = bool(root_update)
+                  rows.append({
+                      "dep": dep_name,
+                      "packages": ", ".join(sorted(packages)),
+                      "root_original": root_original,
+                      "sub_original": source_summary,
+                      "action": compact_action(result, root_changed),
+                      "root_final": root_final,
+                      "member_final": final_member_summary(result),
+                  })
+
+              for dep_name, item in version_update_reports.items():
+                  if dep_name in aligned_deps:
+                      continue
+                  rows.append({
+                      "dep": dep_name,
+                      "packages": ", ".join(item["packages"]),
+                      "root_original": item["before"],
+                      "sub_original": item["requested"],
+                      "action": "raise root",
+                      "root_final": item["after"],
+                      "member_final": "unchanged",
+                  })
+
+              for dep_name, package, origin, source_req, target_req, reason in sorted(set(version_skips)):
+                  rows.append({
+                      "dep": dep_name,
+                      "packages": package,
+                      "root_original": target_req,
+                      "sub_original": source_req,
+                      "action": "explicit: " + reason,
+                      "root_final": target_req,
+                      "member_final": "explicit",
+                  })
+
+              rows.sort(key=lambda row: (row["dep"], row["packages"], row["action"], row["sub_original"]))
+
+              with Path(summary_path).open("a") as summary:
+                  summary.write("\n### Workspace dependency resolving\n")
+                  summary.write("Rule: compatible newer sub-crate version raises root; safe deps use workspace; unsafe deps stay explicit.\n\n")
+                  if rows:
+                      summary.write("| Dependency | Package(s) | Root original | Sub-crate original | Action | Root final | Member final |\n")
+                      summary.write("|---|---|---|---|---|---|---|\n")
+                      for row in rows[:160]:
                           summary.write(
                               "| "
-                              + markdown_cell(dep_name)
+                              + markdown_cell(row["dep"])
                               + " | "
-                              + markdown_cell(package)
+                              + markdown_cell(row["packages"])
                               + " | "
-                              + markdown_cell(origin)
+                              + markdown_cell(row["root_original"])
                               + " | "
-                              + markdown_cell(source_req)
+                              + markdown_cell(row["sub_original"])
                               + " | "
-                              + markdown_cell(target_req)
+                              + markdown_cell(row["action"])
                               + " | "
-                              + markdown_cell(reason)
+                              + markdown_cell(row["root_final"])
+                              + " | "
+                              + markdown_cell(row["member_final"])
                               + " |\n"
                           )
-                      if len(set(version_skips)) > 80:
-                          summary.write(f"\nOnly the first 80 skipped dependency-version rows are shown out of {len(set(version_skips))}.\n")
+                      if len(rows) > 160:
+                          summary.write(f"\nOnly the first 160 dependency resolving rows are shown out of {len(rows)}.\n")
+                  else:
+                      summary.write("No dependency resolving changes.\n")
 
       - name: Remove nested workspace metadata from imported packages
         env:
