@@ -834,10 +834,11 @@ jobs:
                       ordered[key] = val
               return render_dependency_line(dep_name, ordered, indent)
 
-          def rewrite_workspace_dependency_entries(text: str, dep_name: str, rewriter) -> str:
+          def rewrite_workspace_dependency_entries(text: str, dep_name: str, rewriter) -> tuple[str, int]:
               lines = text.splitlines(keepends=True)
               out = []
               i = 0
+              replaced = 0
               start_re = re.compile(
                   rf'^(\s*){re.escape(dep_name)}(?:\.workspace\s*=\s*true|\s*=\s*\{{.*workspace\s*=\s*true)',
                   re.S,
@@ -865,8 +866,63 @@ jobs:
                   original_entry = "\n".join(entry_lines)
                   replacement = rewriter(original_entry)
                   out.append(replacement + ("\n" if line.endswith("\n") else ""))
+                  replaced += 1
 
-              return "".join(out)
+              return "".join(out), replaced
+
+          def dependency_summary(entry: str) -> str:
+              value = dependency_table(entry)
+              version = value.get("version")
+              if isinstance(value.get("path"), str):
+                  base = f"path:{value['path']}"
+              elif isinstance(value.get("git"), str):
+                  ref = value.get("rev") or value.get("tag") or value.get("branch") or "<floating>"
+                  package = value.get("package", value.get("__name", ""))
+                  version_part = f", version {version}" if isinstance(version, str) else ""
+                  base = f"git:{value['git']} @ {ref}, package {package}{version_part}"
+              elif isinstance(version, str):
+                  base = f"version {version}"
+              else:
+                  base = "no explicit version"
+
+              features = ordered_features(value)
+              if features:
+                  shown = ", ".join(features[:8])
+                  if len(features) > 8:
+                      shown += f", …(+{len(features) - 8})"
+                  base += f"; features [{shown}]"
+
+              if default_features(value) is False:
+                  base += "; default-features=false"
+              return base
+
+          def markdown_cell(value: str) -> str:
+              value = re.sub(r'\s+', ' ', value).strip()
+              value = value.replace("|", "\\|")
+              if len(value) > 220:
+                  value = value[:217] + "..."
+              return value
+
+          def package_name_for_manifest(cargo_toml: Path) -> str:
+              try:
+                  data = tomllib.loads(cargo_toml.read_text())
+                  name = data.get("package", {}).get("name")
+                  if isinstance(name, str) and name:
+                      return name
+              except Exception:
+                  pass
+              return str(cargo_toml.parent)
+
+          alignment_reports = {}
+
+          def record_alignment(dep_name: str, source_entry: str, target_entry: str, cargo_toml: Path, result: str):
+              source_summary = dependency_summary(source_entry)
+              target_summary = dependency_summary(target_entry)
+              # Keep the summary focused on intentional source-vs-root differences.
+              if source_summary == target_summary and result == "aligned to target root workspace dependency":
+                  return
+              key = (dep_name, source_summary, target_summary, result)
+              alignment_reports.setdefault(key, set()).add(package_name_for_manifest(cargo_toml))
 
           for item in crates.values():
               target = Path(item["target"])
@@ -880,7 +936,7 @@ jobs:
 
                       target_entry = target_workspace_deps.get(dep_name)
                       if should_expand_source_workspace_dep(dep_name, source_entry):
-                          text = rewrite_workspace_dependency_entries(
+                          text, replaced = rewrite_workspace_dependency_entries(
                               text,
                               dep_name,
                               lambda original_entry, dep_name=dep_name, source_entry=source_entry, cargo_toml=cargo_toml:
@@ -890,16 +946,72 @@ jobs:
 
                       extra_features = missing_workspace_features(source_entry, target_entry)
                       if extra_features:
-                          text = rewrite_workspace_dependency_entries(
+                          text, replaced = rewrite_workspace_dependency_entries(
                               text,
                               dep_name,
                               lambda original_entry, dep_name=dep_name, extra_features=extra_features:
                                   inherited_dependency_line(dep_name, original_entry, extra_features),
                           )
+                          if replaced:
+                              record_alignment(
+                                  dep_name,
+                                  source_entry,
+                                  target_entry,
+                                  cargo_toml,
+                                  "aligned to target root; member adds missing features " + ", ".join(extra_features),
+                              )
+                      else:
+                          probe_text, replaced = rewrite_workspace_dependency_entries(
+                              text,
+                              dep_name,
+                              lambda original_entry: original_entry,
+                          )
+                          # The identity rewrite above is intentionally a no-op; it lets us
+                          # report source/root version discrepancies only for dependencies
+                          # that this imported manifest actually inherits.
+                          text = probe_text
+                          if replaced:
+                              record_alignment(
+                                  dep_name,
+                                  source_entry,
+                                  target_entry,
+                                  cargo_toml,
+                                  "aligned to target root workspace dependency",
+                              )
 
                   if text != original:
                       cargo_toml.write_text(text)
                       print(f"Expanded source workspace dependencies in {cargo_toml}")
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              with Path(summary_path).open("a") as summary:
+                  summary.write("\n### Workspace dependency version alignment\n")
+                  summary.write(
+                      "Imported crates may intentionally inherit the generated root "
+                      "`[workspace.dependencies]` version instead of the source repository's "
+                      "workspace version. This is expected for ordinary crates.io dependencies; "
+                      "unsafe path/git/default-features mismatches are expanded locally instead.\n\n"
+                  )
+                  if alignment_reports:
+                      summary.write("| Dependency | Imported package(s) | Source/sub-crate workspace dependency | Generated root dependency | Result |\n")
+                      summary.write("|---|---|---|---|---|\n")
+                      for (dep_name, source_summary, target_summary, result), packages in sorted(alignment_reports.items()):
+                          summary.write(
+                              "| "
+                              + markdown_cell(dep_name)
+                              + " | "
+                              + markdown_cell(", ".join(sorted(packages)))
+                              + " | "
+                              + markdown_cell(source_summary)
+                              + " | "
+                              + markdown_cell(target_summary)
+                              + " | "
+                              + markdown_cell(result)
+                              + " |\n"
+                          )
+                  else:
+                      summary.write("No source/root workspace dependency version discrepancies required alignment.\n")
 
       - name: Remove nested workspace metadata from imported packages
         env:
