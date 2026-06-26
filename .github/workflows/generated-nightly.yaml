@@ -52,7 +52,7 @@ on:
         type: boolean
 
   schedule:
-    # 17:42 GMT+9 / Asia-Tokyo is 08:42 UTC.
+    # 08:42 UTC / 17:42 GMT+9
     - cron: "42 8 * * *"
 
 permissions:

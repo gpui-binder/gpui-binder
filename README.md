@@ -88,7 +88,7 @@ Optional features can also expose:
 - **Cleaner imports** through `gpui::gpui_platform`, `gpui::gpui_web`, and similar facade namespaces.
 - **A stable generated entry point** for nightly GPUI + `gpui-component` usage.
 
-`gpui_facade` is a packaging and integration layer. It is not intended to improve compile time, runtime CPU usage, memory usage, or binary size.
+Note: `gpui_facade` is a packaging and integration layer. It is not intended to improve compile time, runtime CPU usage, memory usage, or binary size.
 
 ## Generated branches
 
@@ -159,8 +159,7 @@ generated-gpui-nightly
 Schedule:
 
 ```text
-17:42 Asia/Tokyo
-08:42 UTC
+08:42 UTC / 17:42 GMT+9
 ```
 
 It runs:
