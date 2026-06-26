@@ -515,8 +515,9 @@ jobs:
           if not source_root.exists():
               raise SystemExit("Missing _gpui_component_source/Cargo.toml")
 
+          root_path = Path("Cargo.toml")
           source_text = source_root.read_text()
-          root_text = Path("Cargo.toml").read_text()
+          root_text = root_path.read_text()
 
           def extract_section(text: str, section_name: str) -> str:
               match = re.search(
@@ -530,6 +531,7 @@ jobs:
               current = []
               depth_curly = 0
               depth_square = 0
+              current_name = None
 
               for raw_line in section.splitlines():
                   line = raw_line.rstrip()
@@ -538,8 +540,10 @@ jobs:
                       stripped = line.strip()
                       if not stripped or stripped.startswith("#"):
                           continue
-                      if not re.match(r'^[A-Za-z0-9_\-]+\s*=', stripped):
+                      match = re.match(r'^([A-Za-z0-9_\-]+)(?:\.workspace)?\s*=', stripped)
+                      if not match:
                           continue
+                      current_name = match.group(1)
 
                   current.append(line)
 
@@ -553,9 +557,9 @@ jobs:
                       depth_curly = 0
                       depth_square = 0
 
-                      match = re.match(r'^\s*([A-Za-z0-9_\-]+)\s*=', entry)
-                      if match:
-                          entries[match.group(1)] = entry
+                      if current_name:
+                          entries[current_name] = entry
+                      current_name = None
 
               return entries
 
@@ -563,6 +567,20 @@ jobs:
           target_workspace_deps = parse_dependency_entries(
               extract_section(root_text, "workspace.dependencies")
           )
+
+          def parse_dependency_entry(entry: str, dep_name: str, header: str = "dependencies"):
+              try:
+                  parsed = tomllib.loads(f"[{header}]\n" + entry + "\n")
+                  value = parsed.get(header, {}).get(dep_name)
+              except Exception:
+                  value = None
+              if isinstance(value, str):
+                  return {"version": value, "__name": dep_name}
+              if isinstance(value, dict):
+                  out = dict(value)
+                  out["__name"] = dep_name
+                  return out
+              return {"__name": dep_name}
 
           def parse_workspace_dependency_entry(entry: str):
               match = re.match(r'^\s*([A-Za-z0-9_\-]+)\s*=', entry)
@@ -588,18 +606,7 @@ jobs:
               return {"__name": dep_name}
 
           def dependency_entry_table(entry: str, dep_name: str):
-              try:
-                  parsed = tomllib.loads("[dependencies]\n" + entry + "\n")
-                  value = parsed.get("dependencies", {}).get(dep_name)
-              except Exception:
-                  value = None
-              if isinstance(value, str):
-                  return {"version": value, "__name": dep_name}
-              if isinstance(value, dict):
-                  out = dict(value)
-                  out["__name"] = dep_name
-                  return out
-              return {"__name": dep_name}
+              return parse_dependency_entry(entry, dep_name, "dependencies")
 
           def entry_override_kind(entry: str):
               value = dependency_table(entry)
@@ -641,10 +648,76 @@ jobs:
               raw = value.get("default-features")
               return True if raw is None else bool(raw)
 
+          def package_name(value: dict) -> str:
+              name = value.get("__name", "")
+              package = value.get("package", name)
+              return package if isinstance(package, str) else name
+
+          def is_plain_registry_dependency(value: dict) -> bool:
+              # Only rewrite plain registry/crates.io-style dependencies. Path/git
+              # dependencies carry source identity and must not be normalized by a
+              # version-only rule. Custom registries are also left explicit because
+              # the target root entry may not resolve to the same source.
+              return not any(isinstance(value.get(key), str) for key in ("path", "git", "registry"))
+
+          def version_req(value: dict):
+              version = value.get("version")
+              return version if isinstance(version, str) else None
+
+          def parse_simple_version_req(req: str):
+              if not isinstance(req, str):
+                  return None
+              raw = req.strip()
+              if raw.startswith("^"):
+                  raw = raw[1:].strip()
+              match = re.fullmatch(r'(\d+)(?:\.(\d+))?(?:\.(\d+))?', raw)
+              if not match:
+                  return None
+              parts = [int(part) if part is not None else 0 for part in match.groups()]
+              major, minor, patch = parts
+              # A bare "0" is too broad to auto-reason about safely.
+              if major == 0 and match.group(2) is None:
+                  return None
+              return {
+                  "tuple": (major, minor, patch),
+                  "major": major,
+                  "minor": minor,
+                  "patch": patch,
+                  "normalized": raw,
+              }
+
+          def compatibility_lane(parsed_version: dict):
+              major = parsed_version["major"]
+              # For 0.x, Cargo semver compatibility is bounded by the minor
+              # component, so do not auto-merge 0.4 and 0.5 into one root dep.
+              if major == 0:
+                  return (0, parsed_version["minor"])
+              return (major,)
+
+          def version_summary_from_value(value: dict) -> str:
+              req = version_req(value)
+              return req if req is not None else "<no explicit version>"
+
+          def version_identity_is_compatible(source_value: dict, target_value: dict) -> bool:
+              source_req = version_req(source_value)
+              target_req = version_req(target_value)
+              if not source_req or not target_req:
+                  return True
+
+              source_parsed = parse_simple_version_req(source_req)
+              target_parsed = parse_simple_version_req(target_req)
+              if source_parsed and target_parsed:
+                  return compatibility_lane(source_parsed) == compatibility_lane(target_parsed)
+
+              # Unsupported version expressions are not safe to normalize when
+              # they differ, because we cannot robustly compare their ranges with
+              # only the standard library available in the workflow.
+              return source_req == target_req
+
           def target_workspace_dep_is_inheritable(source_entry: str, target_entry: str) -> bool:
               """Return whether imported manifests may keep dep = { workspace = true }.
 
-              This checks dependency *identity* and non-additive behavior. Feature
+              This checks dependency identity and non-additive behavior. Feature
               differences are handled separately by adding missing source features
               to the member dependency line, because workspace and member features
               are additive.
@@ -661,12 +734,23 @@ jobs:
               source_value = dependency_table(source_entry)
               target_value = dependency_table(target_entry)
 
+              if package_name(source_value) != package_name(target_value):
+                  return False
+
               # Git dependencies must point at the same repo/ref/package/version.
               # Otherwise workspace inheritance would silently switch sources.
               if source_kind == "git" or target_kind == "git":
                   if source_kind != "git" or target_kind != "git":
                       return False
                   if git_identity(source_value) != git_identity(target_value):
+                      return False
+
+              # Plain registry dependencies can inherit only when the version
+              # requirements are in the same compatibility lane. The root version
+              # may have been raised earlier in this step to the highest compatible
+              # imported lower bound.
+              if source_kind is None and target_kind is None:
+                  if not version_identity_is_compatible(source_value, target_value):
                       return False
 
               # default-features is not additive like features. If the source and
@@ -693,8 +777,9 @@ jobs:
                   return True
 
               # Inherit target workspace dependencies whenever that is semantically
-              # safe. For normal crates.io dependencies, this deliberately aligns
-              # the imported package to the generated Zed workspace version/source.
+              # safe. For ordinary registry dependencies, this aligns the imported
+              # package to the generated root workspace version after the root has
+              # been reconciled to the highest compatible imported lower bound.
               return not target_workspace_dep_is_inheritable(source_entry, target_entry)
 
           def render_toml_value(value):
@@ -746,6 +831,153 @@ jobs:
                           seen.add(feature)
               return out
 
+          def dependency_summary(entry: str) -> str:
+              value = dependency_table(entry)
+              version = value.get("version")
+              if isinstance(value.get("path"), str):
+                  base = f"path:{value['path']}"
+              elif isinstance(value.get("git"), str):
+                  ref = value.get("rev") or value.get("tag") or value.get("branch") or "<floating>"
+                  package = value.get("package", value.get("__name", ""))
+                  version_part = f", version {version}" if isinstance(version, str) else ""
+                  base = f"git:{value['git']} @ {ref}, package {package}{version_part}"
+              elif isinstance(version, str):
+                  base = f"version {version}"
+              else:
+                  base = "no explicit version"
+
+              features = ordered_features(value)
+              if features:
+                  shown = ", ".join(features[:8])
+                  if len(features) > 8:
+                      shown += f", …(+{len(features) - 8})"
+                  base += f"; features [{shown}]"
+
+              if default_features(value) is False:
+                  base += "; default-features=false"
+              return base
+
+          def markdown_cell(value: str) -> str:
+              value = re.sub(r'\s+', ' ', value).strip()
+              value = value.replace("|", "\\|")
+              if len(value) > 220:
+                  value = value[:217] + "..."
+              return value
+
+          def package_name_for_manifest(cargo_toml: Path) -> str:
+              try:
+                  data = tomllib.loads(cargo_toml.read_text())
+                  name = data.get("package", {}).get("name")
+                  if isinstance(name, str) and name:
+                      return name
+              except Exception:
+                  pass
+              return str(cargo_toml.parent)
+
+          def dependency_section_header(name: str) -> bool:
+              if name in {"dependencies", "dev-dependencies", "build-dependencies"}:
+                  return True
+              return name.startswith("target.") and name.endswith((
+                  ".dependencies",
+                  ".dev-dependencies",
+                  ".build-dependencies",
+              ))
+
+          def iter_dependency_sections(text: str):
+              headers = list(re.finditer(r'(?m)^\[([^\]]+)\][^\S\r\n]*$', text))
+              for index, header in enumerate(headers):
+                  name = header.group(1)
+                  if not dependency_section_header(name):
+                      continue
+                  body_start = header.end()
+                  if body_start < len(text) and text[body_start] == "\n":
+                      body_start += 1
+                  section_end = headers[index + 1].start() if index + 1 < len(headers) else len(text)
+                  yield name, body_start, section_end, text[body_start:section_end]
+
+          def rewrite_named_entries_in_section(section: str, dep_name: str, rewriter) -> tuple[str, int]:
+              lines = section.splitlines(keepends=True)
+              out = []
+              i = 0
+              replaced = 0
+              start_re = re.compile(rf'^\s*{re.escape(dep_name)}(?:\.workspace\s*=|\s*=)')
+              while i < len(lines):
+                  line = lines[i]
+                  if not start_re.match(line):
+                      out.append(line)
+                      i += 1
+                      continue
+
+                  entry_lines = []
+                  depth_curly = 0
+                  depth_square = 0
+                  while i < len(lines):
+                      current = lines[i]
+                      entry_lines.append(current)
+                      code = current.split("#", 1)[0]
+                      depth_curly += code.count("{") - code.count("}")
+                      depth_square += code.count("[") - code.count("]")
+                      i += 1
+                      if depth_curly <= 0 and depth_square <= 0:
+                          break
+
+                  entry_text = "".join(entry_lines)
+                  replacement = rewriter(entry_text.rstrip("\n"))
+                  if replacement is None:
+                      out.append(entry_text)
+                  else:
+                      out.append(replacement + ("\n" if entry_text.endswith("\n") else ""))
+                      replaced += 1
+
+              return "".join(out), replaced
+
+          def rewrite_dependency_entries_in_dependency_sections(text: str, dep_name: str, rewriter) -> tuple[str, int]:
+              replacements = []
+              total = 0
+              for _, body_start, section_end, body in iter_dependency_sections(text):
+                  new_body, replaced = rewrite_named_entries_in_section(body, dep_name, rewriter)
+                  if replaced:
+                      replacements.append((body_start, section_end, new_body))
+                      total += replaced
+
+              for body_start, section_end, new_body in reversed(replacements):
+                  text = text[:body_start] + new_body + text[section_end:]
+              return text, total
+
+          def rewrite_workspace_dependency_entries(text: str, dep_name: str, rewriter) -> tuple[str, int]:
+              def only_workspace(original_entry: str):
+                  value = dependency_entry_table(original_entry, dep_name)
+                  if value.get("workspace") is not True:
+                      return None
+                  return rewriter(original_entry)
+              return rewrite_dependency_entries_in_dependency_sections(text, dep_name, only_workspace)
+
+          def replace_workspace_dependency_entry(text: str, dep_name: str, replacement_entry: str) -> tuple[str, int]:
+              match = re.search(r'(?m)^\[workspace\.dependencies\][^\S\r\n]*$', text)
+              if not match:
+                  return text, 0
+              body_start = match.end()
+              if body_start < len(text) and text[body_start] == "\n":
+                  body_start += 1
+              next_header = re.search(r'(?m)^\[', text[body_start:])
+              section_end = body_start + next_header.start() if next_header else len(text)
+              section = text[body_start:section_end]
+              new_section, replaced = rewrite_named_entries_in_section(
+                  section,
+                  dep_name,
+                  lambda _entry: replacement_entry,
+              )
+              if replaced:
+                  return text[:body_start] + new_section + text[section_end:], replaced
+              return text, 0
+
+          def update_workspace_entry_version(entry: str, dep_name: str, new_version: str) -> str:
+              if re.match(rf'^\s*{re.escape(dep_name)}\s*=\s*"[^"]+"\s*$', entry):
+                  return re.sub(r'"[^"]+"', json.dumps(new_version), entry, count=1)
+              if re.search(r'\bversion\s*=', entry):
+                  return re.sub(r'(\bversion\s*=\s*)"[^"]+"', rf'\1{json.dumps(new_version)}', entry, count=1)
+              return entry
+
           local_packages = {}
           for cargo_toml in Path("crates").glob("*/Cargo.toml"):
               try:
@@ -756,6 +988,120 @@ jobs:
               if name:
                   local_packages[name] = cargo_toml.parent
 
+          version_candidates = {}
+          version_skips = []
+
+          def add_version_candidate(dep_name: str, source_entry: str, cargo_toml: Path, origin: str):
+              if dep_name in imported_packages or dep_name == "gpui":
+                  return
+              target_entry = target_workspace_deps.get(dep_name)
+              if not target_entry:
+                  return
+
+              source_value = dependency_table(source_entry)
+              target_value = dependency_table(target_entry)
+              package = package_name_for_manifest(cargo_toml)
+
+              if not is_plain_registry_dependency(source_value) or not is_plain_registry_dependency(target_value):
+                  return
+              if package_name(source_value) != package_name(target_value):
+                  version_skips.append((dep_name, package, origin, version_summary_from_value(source_value), version_summary_from_value(target_value), "package/source identity differs"))
+                  return
+              if default_features(source_value) != default_features(target_value):
+                  version_skips.append((dep_name, package, origin, version_summary_from_value(source_value), version_summary_from_value(target_value), "default-features differs"))
+                  return
+
+              source_req = version_req(source_value)
+              target_req = version_req(target_value)
+              source_parsed = parse_simple_version_req(source_req) if source_req else None
+              target_parsed = parse_simple_version_req(target_req) if target_req else None
+              if not source_parsed or not target_parsed:
+                  if source_req and target_req and source_req != target_req:
+                      version_skips.append((dep_name, package, origin, source_req, target_req, "unsupported version requirement syntax"))
+                  return
+
+              if compatibility_lane(source_parsed) != compatibility_lane(target_parsed):
+                  version_skips.append((dep_name, package, origin, source_req, target_req, "different Cargo-compatible version lane"))
+                  return
+
+              version_candidates.setdefault(dep_name, []).append({
+                  "package": package,
+                  "origin": origin,
+                  "source_entry": source_entry,
+                  "source_value": source_value,
+                  "source_req": source_req,
+                  "source_parsed": source_parsed,
+              })
+
+          for item in crates.values():
+              target = Path(item["target"])
+              for cargo_toml in target.rglob("Cargo.toml"):
+                  manifest_text = cargo_toml.read_text()
+                  for _, _, _, section in iter_dependency_sections(manifest_text):
+                      for dep_name, original_entry in parse_dependency_entries(section).items():
+                          original_value = dependency_entry_table(original_entry, dep_name)
+                          if original_value.get("workspace") is True:
+                              source_entry = source_deps.get(dep_name)
+                              if source_entry:
+                                  add_version_candidate(dep_name, source_entry, cargo_toml, "source workspace")
+                          else:
+                              add_version_candidate(dep_name, original_entry, cargo_toml, "member dependency")
+
+          version_update_reports = {}
+          for dep_name, candidates in sorted(version_candidates.items()):
+              target_entry = target_workspace_deps.get(dep_name)
+              if not target_entry:
+                  continue
+              target_value = dependency_table(target_entry)
+              target_req = version_req(target_value)
+              target_parsed = parse_simple_version_req(target_req) if target_req else None
+              if not target_parsed:
+                  continue
+
+              chosen = {
+                  "tuple": target_parsed["tuple"],
+                  "version": target_parsed["normalized"],
+                  "source": "generated root",
+              }
+              for candidate in candidates:
+                  parsed = candidate["source_parsed"]
+                  if parsed["tuple"] > chosen["tuple"]:
+                      chosen = {
+                          "tuple": parsed["tuple"],
+                          "version": parsed["normalized"],
+                          "source": candidate["package"],
+                      }
+
+              if chosen["tuple"] <= target_parsed["tuple"]:
+                  continue
+
+              replacement_entry = update_workspace_entry_version(target_entry, dep_name, chosen["version"])
+              if replacement_entry == target_entry:
+                  version_skips.append((dep_name, "generated root", "root update", chosen["version"], target_req, "could not rewrite root workspace entry"))
+                  continue
+
+              root_text, replaced = replace_workspace_dependency_entry(root_text, dep_name, replacement_entry)
+              if not replaced:
+                  version_skips.append((dep_name, "generated root", "root update", chosen["version"], target_req, "could not find root workspace entry"))
+                  continue
+
+              target_workspace_deps[dep_name] = replacement_entry
+              requested = sorted({f"{candidate['package']}: {candidate['source_req']}" for candidate in candidates})
+              version_update_reports[dep_name] = {
+                  "packages": sorted({candidate["package"] for candidate in candidates}),
+                  "before": dependency_summary(target_entry),
+                  "requested": "; ".join(requested),
+                  "after": dependency_summary(replacement_entry),
+                  "result": f"root workspace version raised to {chosen['version']}",
+              }
+              print(f"Raised root workspace dependency {dep_name}: {target_req} -> {chosen['version']}")
+
+          if version_update_reports:
+              root_path.write_text(root_text)
+              target_workspace_deps = parse_dependency_entries(
+                  extract_section(root_text, "workspace.dependencies")
+              )
+
           def source_dependency_value_for_manifest(source_entry: str, dep_name: str, manifest: Path) -> dict:
               source_value = dependency_table(source_entry)
               value = {
@@ -765,9 +1111,9 @@ jobs:
               }
 
               git_url = value.get("git")
-              package_name = value.get("package", dep_name)
+              package = value.get("package", dep_name)
               if isinstance(git_url, str) and "github.com/zed-industries/" in git_url:
-                  local_path = local_packages.get(package_name)
+                  local_path = local_packages.get(package)
                   if local_path:
                       relative_path = os.path.relpath(local_path, manifest.parent).replace(os.sep, "/")
                       value = {
@@ -776,11 +1122,11 @@ jobs:
                           if key not in {"git", "rev", "tag", "branch", "version"}
                       }
                       value["path"] = relative_path
-                      if package_name != dep_name:
-                          value["package"] = package_name
+                      if package != dep_name:
+                          value["package"] = package
                       print(f"Rewrote {dep_name} for {manifest}: zed-industries git -> {relative_path}")
                   else:
-                      print(f"No local Zed package for {dep_name} / {package_name}; keeping source dependency.")
+                      print(f"No local Zed package for {dep_name} / {package}; keeping source dependency.")
 
               return value
 
@@ -834,84 +1180,41 @@ jobs:
                       ordered[key] = val
               return render_dependency_line(dep_name, ordered, indent)
 
-          def rewrite_workspace_dependency_entries(text: str, dep_name: str, rewriter) -> tuple[str, int]:
-              lines = text.splitlines(keepends=True)
-              out = []
-              i = 0
-              replaced = 0
-              start_re = re.compile(
-                  rf'^(\s*){re.escape(dep_name)}(?:\.workspace\s*=\s*true|\s*=\s*\{{.*workspace\s*=\s*true)',
-                  re.S,
-              )
-              while i < len(lines):
-                  line = lines[i]
-                  if not start_re.match(line):
-                      out.append(line)
-                      i += 1
-                      continue
+          def direct_dependency_can_inherit(dep_name: str, original_entry: str, target_entry: str):
+              original_value = dependency_entry_table(original_entry, dep_name)
+              target_value = dependency_table(target_entry)
 
-                  entry_lines = [line.rstrip("\n")]
-                  code = line.split("#", 1)[0]
-                  depth_curly = code.count("{") - code.count("}")
-                  depth_square = code.count("[") - code.count("]")
-                  i += 1
-                  while i < len(lines) and (depth_curly > 0 or depth_square > 0):
-                      next_line = lines[i]
-                      entry_lines.append(next_line.rstrip("\n"))
-                      code = next_line.split("#", 1)[0]
-                      depth_curly += code.count("{") - code.count("}")
-                      depth_square += code.count("[") - code.count("]")
-                      i += 1
+              if original_value.get("workspace") is True:
+                  return None
+              if not is_plain_registry_dependency(original_value) or not is_plain_registry_dependency(target_value):
+                  return None
+              if package_name(original_value) != package_name(target_value):
+                  return None
+              if default_features(original_value) != default_features(target_value):
+                  return None
 
-                  original_entry = "\n".join(entry_lines)
-                  replacement = rewriter(original_entry)
-                  out.append(replacement + ("\n" if line.endswith("\n") else ""))
-                  replaced += 1
+              original_req = version_req(original_value)
+              target_req = version_req(target_value)
+              original_parsed = parse_simple_version_req(original_req) if original_req else None
+              target_parsed = parse_simple_version_req(target_req) if target_req else None
+              if not original_parsed or not target_parsed:
+                  return None
+              if compatibility_lane(original_parsed) != compatibility_lane(target_parsed):
+                  return None
+              if target_parsed["tuple"] < original_parsed["tuple"]:
+                  return None
 
-              return "".join(out), replaced
-
-          def dependency_summary(entry: str) -> str:
-              value = dependency_table(entry)
-              version = value.get("version")
-              if isinstance(value.get("path"), str):
-                  base = f"path:{value['path']}"
-              elif isinstance(value.get("git"), str):
-                  ref = value.get("rev") or value.get("tag") or value.get("branch") or "<floating>"
-                  package = value.get("package", value.get("__name", ""))
-                  version_part = f", version {version}" if isinstance(version, str) else ""
-                  base = f"git:{value['git']} @ {ref}, package {package}{version_part}"
-              elif isinstance(version, str):
-                  base = f"version {version}"
-              else:
-                  base = "no explicit version"
-
-              features = ordered_features(value)
-              if features:
-                  shown = ", ".join(features[:8])
-                  if len(features) > 8:
-                      shown += f", …(+{len(features) - 8})"
-                  base += f"; features [{shown}]"
-
-              if default_features(value) is False:
-                  base += "; default-features=false"
-              return base
-
-          def markdown_cell(value: str) -> str:
-              value = re.sub(r'\s+', ' ', value).strip()
-              value = value.replace("|", "\\|")
-              if len(value) > 220:
-                  value = value[:217] + "..."
-              return value
-
-          def package_name_for_manifest(cargo_toml: Path) -> str:
-              try:
-                  data = tomllib.loads(cargo_toml.read_text())
-                  name = data.get("package", {}).get("name")
-                  if isinstance(name, str) and name:
-                      return name
-              except Exception:
-                  pass
-              return str(cargo_toml.parent)
+              extra_features = [
+                  feature
+                  for feature in ordered_features(original_value)
+                  if feature not in feature_set(target_value)
+              ]
+              inherited = {"workspace": True}
+              if extra_features:
+                  inherited["features"] = extra_features
+              if "optional" in original_value:
+                  inherited["optional"] = original_value["optional"]
+              return inherited
 
           alignment_reports = {}
 
@@ -936,7 +1239,7 @@ jobs:
 
                       target_entry = target_workspace_deps.get(dep_name)
                       if should_expand_source_workspace_dep(dep_name, source_entry):
-                          text, replaced = rewrite_workspace_dependency_entries(
+                          text, _ = rewrite_workspace_dependency_entries(
                               text,
                               dep_name,
                               lambda original_entry, dep_name=dep_name, source_entry=source_entry, cargo_toml=cargo_toml:
@@ -979,22 +1282,75 @@ jobs:
                                   "aligned to target root workspace dependency",
                               )
 
+                  # Convert direct external dependencies to workspace inheritance only
+                  # after the root has been raised to the highest compatible imported
+                  # version. This keeps normal registry deps centralized while leaving
+                  # git/path/default-features/incompatible ranges explicit.
+                  for dep_name, target_entry in sorted(target_workspace_deps.items()):
+                      if dep_name in imported_packages or dep_name == "gpui":
+                          continue
+
+                      def direct_rewriter(original_entry: str, dep_name=dep_name, target_entry=target_entry, cargo_toml=cargo_toml):
+                          original_value = dependency_entry_table(original_entry, dep_name)
+                          if original_value.get("workspace") is True:
+                              return None
+                          inherited = direct_dependency_can_inherit(dep_name, original_entry, target_entry)
+                          if inherited is None:
+                              return None
+                          indent_match = re.match(r'^(\s*)', original_entry)
+                          indent = indent_match.group(1) if indent_match else ""
+                          line = render_dependency_line(dep_name, inherited, indent)
+                          record_alignment(
+                              dep_name,
+                              original_entry,
+                              target_entry,
+                              cargo_toml,
+                              "direct member dependency converted to workspace inheritance",
+                          )
+                          return line
+
+                      text, _ = rewrite_dependency_entries_in_dependency_sections(text, dep_name, direct_rewriter)
+
                   if text != original:
                       cargo_toml.write_text(text)
-                      print(f"Expanded source workspace dependencies in {cargo_toml}")
+                      print(f"Aligned source workspace dependencies in {cargo_toml}")
 
           summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
           if summary_path:
               with Path(summary_path).open("a") as summary:
                   summary.write("\n### Workspace dependency version alignment\n")
                   summary.write(
-                      "Imported crates may intentionally inherit the generated root "
-                      "`[workspace.dependencies]` version instead of the source repository's "
-                      "workspace version. This is expected for ordinary crates.io dependencies; "
-                      "unsafe path/git/default-features mismatches are expanded locally instead.\n\n"
+                      "Imported crates inherit the generated root `[workspace.dependencies]` "
+                      "when it is semantically safe. For ordinary registry dependencies, "
+                      "the root version is first raised to the highest Cargo-compatible "
+                      "imported lower bound; unsafe path/git/default-features/version-lane "
+                      "mismatches are expanded locally instead.\n\n"
                   )
+                  if version_update_reports:
+                      summary.write("#### Root workspace dependency version updates\n\n")
+                      summary.write("| Dependency | Imported package(s) | Generated root before | Imported requested version(s) | Generated root after | Result |\n")
+                      summary.write("|---|---|---|---|---|---|\n")
+                      for dep_name, item in sorted(version_update_reports.items()):
+                          summary.write(
+                              "| "
+                              + markdown_cell(dep_name)
+                              + " | "
+                              + markdown_cell(", ".join(item["packages"]))
+                              + " | "
+                              + markdown_cell(item["before"])
+                              + " | "
+                              + markdown_cell(item["requested"])
+                              + " | "
+                              + markdown_cell(item["after"])
+                              + " | "
+                              + markdown_cell(item["result"])
+                              + " |\n"
+                          )
+                      summary.write("\n")
+
                   if alignment_reports:
-                      summary.write("| Dependency | Imported package(s) | Source/sub-crate workspace dependency | Generated root dependency | Result |\n")
+                      summary.write("#### Member dependency alignment\n\n")
+                      summary.write("| Dependency | Imported package(s) | Source/sub-crate dependency | Generated root dependency | Result |\n")
                       summary.write("|---|---|---|---|---|\n")
                       for (dep_name, source_summary, target_summary, result), packages in sorted(alignment_reports.items()):
                           summary.write(
@@ -1010,8 +1366,31 @@ jobs:
                               + markdown_cell(result)
                               + " |\n"
                           )
-                  else:
+                  elif not version_update_reports:
                       summary.write("No source/root workspace dependency version discrepancies required alignment.\n")
+
+                  if version_skips:
+                      summary.write("\n#### Dependency versions left explicit or unchanged\n\n")
+                      summary.write("| Dependency | Imported package | Origin | Source/sub-crate version | Generated root version | Reason |\n")
+                      summary.write("|---|---|---|---|---|---|\n")
+                      for dep_name, package, origin, source_req, target_req, reason in sorted(set(version_skips))[:80]:
+                          summary.write(
+                              "| "
+                              + markdown_cell(dep_name)
+                              + " | "
+                              + markdown_cell(package)
+                              + " | "
+                              + markdown_cell(origin)
+                              + " | "
+                              + markdown_cell(source_req)
+                              + " | "
+                              + markdown_cell(target_req)
+                              + " | "
+                              + markdown_cell(reason)
+                              + " |\n"
+                          )
+                      if len(set(version_skips)) > 80:
+                          summary.write(f"\nOnly the first 80 skipped dependency-version rows are shown out of {len(set(version_skips))}.\n")
 
       - name: Remove nested workspace metadata from imported packages
         env:
