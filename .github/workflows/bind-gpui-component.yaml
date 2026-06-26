@@ -384,11 +384,16 @@ jobs:
                   raise FileNotFoundError(source)
 
           references = []
+          ignored_node_modules = []
           imported = []
           missing = []
           source_missing = []
           outside_source = []
           scanned_rs_files = 0
+          skipped_node_modules_rs_files = 0
+
+          def has_node_modules_part(path: Path) -> bool:
+              return "node_modules" in path.parts
 
           for package, item in sorted(crates.items()):
               source_pkg_dir = Path(item["source"]).resolve()
@@ -407,14 +412,18 @@ jobs:
                   continue
 
               for source_rs in sorted(source_pkg_dir.rglob("*.rs")):
-                  if any(part in ignored_dirs for part in source_rs.relative_to(source_pkg_dir).parts):
-                      continue
-                  scanned_rs_files += 1
-
                   try:
                       rel_rs = source_rs.relative_to(source_pkg_dir)
                   except ValueError:
                       continue
+
+                  if "node_modules" in rel_rs.parts:
+                      skipped_node_modules_rs_files += 1
+                      continue
+
+                  if any(part in ignored_dirs for part in rel_rs.parts):
+                      continue
+                  scanned_rs_files += 1
 
                   target_rs = target_pkg_dir / rel_rs
                   if not target_rs.exists():
@@ -458,6 +467,17 @@ jobs:
                               "target_resolved": str(target_resolved),
                               "line_text": line.strip(),
                           }
+
+                          if (
+                              "node_modules" in Path(rel_path_text).parts
+                              or has_node_modules_part(source_resolved)
+                              or has_node_modules_part(target_resolved)
+                          ):
+                              ignored_reference = dict(reference)
+                              ignored_reference["reason"] = "ignored because the referenced path is under node_modules"
+                              ignored_node_modules.append(ignored_reference)
+                              continue
+
                           references.append(reference)
 
                           if not is_under(source_resolved, source_root):
@@ -537,25 +557,40 @@ jobs:
                       write_rows(summary, rows)
                       summary.write("\n")
 
+                  if ignored_node_modules:
+                      summary.write("#### Ignored node_modules relative path references\n\n")
+                      summary.write(
+                          "These paths are intentionally ignored because they point to files/folders under `node_modules`.\n\n"
+                      )
+                      summary.write("| Package | Rust file | Line | Relative path | Generated target path | Reason |\n")
+                      summary.write("|---|---|---:|---|---|---|\n")
+                      write_rows(summary, ignored_node_modules)
+                      summary.write("\n")
+
                   if failures:
                       summary.write("#### Missing relative path resources\n\n")
-                      summary.write("These paths were referenced from imported Rust files but were not found in the generated workspace.\n\n")
+                      summary.write(
+                          "These paths were referenced from imported Rust files but were not found in the generated workspace. "
+                          "References under `node_modules` are excluded from this failure list.\n\n"
+                      )
                       summary.write("| Package | Rust file | Line | Relative path | Generated target path | Reason |\n")
                       summary.write("|---|---|---:|---|---|---|\n")
                       write_rows(summary, failures)
                   else:
-                      summary.write("All extracted relative path resources resolve in the generated workspace.\n")
+                      summary.write("All checked relative path resources resolve in the generated workspace.\n")
 
           print(
               f"Relative path resource validation: scanned {scanned_rs_files} Rust files, "
-              f"found {len(references)} references, imported {len(imported)} resources, "
-              f"failures {len(failures)}."
+              f"skipped {skipped_node_modules_rs_files} node_modules Rust files, "
+              f"found {len(references)} checked references, "
+              f"ignored {len(ignored_node_modules)} node_modules references, "
+              f"imported {len(imported)} resources, failures {len(failures)}."
           )
 
           if failures:
               raise SystemExit(
-                  "Missing relative path resources referenced by imported gpui-component Rust files. "
-                  "See the GitHub workflow summary for details."
+                  "Missing relative path resources referenced by imported gpui-component Rust files "
+                  "after excluding node_modules paths. See the GitHub workflow summary for details."
               )
 
       - name: Patch root workspace Cargo.toml
@@ -2346,7 +2381,7 @@ jobs:
             echo
             echo "Validated generated branch with:"
             echo "- cargo metadata --no-deps --format-version=1"
-            echo "- relative path resource scan/import validation for imported Rust files"
+            echo "- relative path resource scan/import validation for imported Rust files (node_modules ignored)"
             echo "- cargo check for imported packages plus gpui_facade only"
             echo
             echo "Checked packages:"
@@ -2457,4 +2492,5 @@ jobs:
             echo "- A source dependency inherited from \`[workspace.dependencies]\` needs features that the target workspace does not provide."
             echo "- A source dependency has the same name as a target workspace dependency but a different git/rev/package/default-features identity."
             echo "- An imported package or local path dependency was renamed upstream and no longer matches the discovered package graph."
+            echo "- A relative path resource referenced by imported Rust code was over-excluded or missing; paths under \`node_modules\` are ignored by design."
           } >> "$GITHUB_STEP_SUMMARY"
