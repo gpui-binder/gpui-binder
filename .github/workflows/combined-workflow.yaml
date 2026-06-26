@@ -99,28 +99,23 @@ jobs:
 
             local run_id=""
 
-            for i in $(seq 1 60); do
+            for i in $(seq 1 90); do
               run_id="$(
                 gh run list \
                   --repo "${GH_REPO}" \
                   --workflow "${workflow_file}" \
                   --branch "${WORKFLOW_REF}" \
                   --event workflow_dispatch \
-                  --limit 30 \
-                  --json databaseId,createdAt,status \
-                | jq -r --arg started_at "${started_at}" '
-                    map(select(.createdAt >= $started_at))
-                    | sort_by(.createdAt)
-                    | reverse
-                    | .[0].databaseId // empty
-                  '
+                  --limit 10 \
+                  --json databaseId,createdAt \
+                  --jq 'map(select(.createdAt >= "'"${started_at}"'")) | sort_by(.createdAt) | reverse | .[0].databaseId // empty'
               )"
 
               if [ -n "${run_id}" ]; then
                 break
               fi
 
-              sleep 5
+              sleep 2
             done
 
             if [ -z "${run_id}" ]; then

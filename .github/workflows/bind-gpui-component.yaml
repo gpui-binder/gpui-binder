@@ -40,18 +40,60 @@ jobs:
       TARGET_BRANCH: ${{ inputs.target_branch }}
       SOURCE_ROOT_PACKAGE: ${{ inputs.source_root_package }}
       CARGO_TARGET_DIR: /tmp/cargo-target
+      CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+      CARGO_INCREMENTAL: 0
 
     steps:
-      - name: Install Linux cargo dependencies
+      - name: Install missing Linux cargo dependencies
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
+
+          pkg_config_modules=(
+            gtk+-3.0
+            gdk-pixbuf-2.0
+            atk
+            pango
+            cairo
+            glib-2.0
+            fontconfig
+            xkbcommon
+            wayland-client
+            x11
+            xcb
+            xcb-render
+            xcb-shape
+            xcb-xfixes
+            openssl
+          )
+
+          missing=false
+          if ! command -v pkg-config >/dev/null 2>&1; then
+            missing=true
+          else
+            for module in "${pkg_config_modules[@]}"; do
+              if ! pkg-config --exists "$module"; then
+                missing=true
+                break
+              fi
+            done
+          fi
+
+          if [ "$missing" = "false" ]; then
+            echo "All Linux native cargo dependencies are already available; skipping apt."
+            exit 0
+          fi
+
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libgtk-3-dev \
+            libgdk-pixbuf-2.0-dev \
+            libatk1.0-dev \
             libpango1.0-dev \
             libcairo2-dev \
-            pkg-config \
+            libglib2.0-dev \
             libfontconfig1-dev \
             libxkbcommon-dev \
             libwayland-dev \
@@ -63,23 +105,26 @@ jobs:
             libssl-dev
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/.rustup/toolchains
+            ~/.rustup/update-hashes
             /tmp/cargo-target
-          key: cargo-${{ runner.os }}-${{ inputs.zed_ref }}-${{ inputs.source_repo }}-${{ inputs.source_ref }}-bind-gpui-component-v1
+          key: cargo-${{ runner.os }}-${{ inputs.zed_ref }}-${{ inputs.source_repo }}-${{ inputs.source_ref }}-bind-gpui-component-v2-${{ github.run_id }}
           restore-keys: |
+            cargo-${{ runner.os }}-${{ inputs.zed_ref }}-${{ inputs.source_repo }}-${{ inputs.source_ref }}-bind-gpui-component-v2-
             cargo-${{ runner.os }}-${{ inputs.zed_ref }}-${{ inputs.source_repo }}-
             cargo-${{ runner.os }}-${{ inputs.zed_ref }}-
             cargo-${{ runner.os }}-
 
       - name: Checkout zed fork
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ inputs.zed_ref }}
-          fetch-depth: 0
+          fetch-depth: 1
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Configure git identity
@@ -96,7 +141,7 @@ jobs:
           git checkout -B "${TARGET_BRANCH}"
 
       - name: Checkout gpui-component source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ${{ inputs.source_repo }}
           ref: ${{ inputs.source_ref }}

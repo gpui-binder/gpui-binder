@@ -113,28 +113,23 @@ jobs:
 
             local run_id=""
 
-            for i in $(seq 1 60); do
+            for i in $(seq 1 90); do
               run_id="$(
                 gh run list \
                   --repo "${GH_REPO}" \
                   --workflow "${workflow_file}" \
                   --branch "${WORKFLOW_REF}" \
                   --event workflow_dispatch \
-                  --limit 30 \
-                  --json databaseId,createdAt,status \
-                | jq -r --arg started_at "${started_at}" '
-                    map(select(.createdAt >= $started_at))
-                    | sort_by(.createdAt)
-                    | reverse
-                    | .[0].databaseId // empty
-                  '
+                  --limit 10 \
+                  --json databaseId,createdAt \
+                  --jq 'map(select(.createdAt >= "'"${started_at}"'")) | sort_by(.createdAt) | reverse | .[0].databaseId // empty'
               )"
 
               if [ -n "${run_id}" ]; then
                 break
               fi
 
-              sleep 5
+              sleep 2
             done
 
             if [ -z "${run_id}" ]; then
@@ -184,10 +179,11 @@ jobs:
             -f fail_on_warnings="${FAIL_ON_WARNINGS}"
 
       - name: Checkout generated gpui nightly branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ env.BIND_TARGET_BRANCH }}
-          fetch-depth: 0
+          # Only HEAD and HEAD^ are needed to detect a previous README-only commit.
+          fetch-depth: 2
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Configure git identity
