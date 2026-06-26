@@ -19,6 +19,7 @@ on:
     # Every day at 17:33 GMT+9 = 08:33 UTC.
     # Scheduled runs always keep the last 14 days.
     - cron: "33 8 * * *"
+      timezone: "Etc/UTC"
 
 permissions:
   actions: write

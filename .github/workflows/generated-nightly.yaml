@@ -39,12 +39,6 @@ on:
         default: "generated-gpui-nightly"
         type: string
 
-      force_push:
-        description: "Force push generated branches if they already exist"
-        required: true
-        default: true
-        type: boolean
-
       fail_on_warnings:
         description: "Fail check-cargo-local-dependencies.yaml when warnings are found"
         required: true
@@ -54,6 +48,7 @@ on:
   schedule:
     # 08:42 UTC / 17:42 GMT+9
     - cron: "42 8 * * *"
+      timezone: "Etc/UTC"
 
 permissions:
   contents: write
@@ -80,7 +75,7 @@ jobs:
       SOURCE_REF: ${{ inputs.source_ref || 'main' }}
       FORK_OUTPUT_BRANCH: ${{ inputs.fork_output_branch || 'generated-zed-nightly' }}
       BIND_TARGET_BRANCH: ${{ inputs.bind_target_branch || 'generated-gpui-nightly' }}
-      FORCE_PUSH: ${{ inputs.force_push == false && 'false' || 'true' }}
+      FORCE_PUSH: "true"
       FAIL_ON_WARNINGS: ${{ inputs.fail_on_warnings == true && 'true' || 'false' }}
 
     steps:
