@@ -516,9 +516,13 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libgtk-3-dev \
+            libgdk-pixbuf-2.0-dev \
+            libatk1.0-dev \
             libpango1.0-dev \
             libcairo2-dev \
-            pkg-config \
+            libglib2.0-dev \
             libfontconfig1-dev \
             libxkbcommon-dev \
             libwayland-dev \
@@ -1064,17 +1068,50 @@ jobs:
             printf '%s' "${!env_name}" > "$full_path"
           }
 
-          rename_original_root_readme() {
-            local src="$OUT_DIR/README.md"
-            local dst="$OUT_DIR/README-zed.md"
+          rename_original_root_readmes() {
+            python3 - "$OUT_DIR" "$UPSTREAM_REPO" "$UPSTREAM_BRANCH" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
 
-            if [ -f "$src" ]; then
-              echo "Renaming original root README.md to README-zed.md"
-              rm -f "$dst"
-              mv "$src" "$dst"
-            else
-              echo "No root README.md found to rename"
-            fi
+          root = Path(sys.argv[1])
+          repo = sys.argv[2]
+          ref = sys.argv[3]
+
+          pattern = re.compile(r"^README(?:\..+)?\.md$", re.IGNORECASE)
+
+          def renamed(name: str) -> str:
+              if name.lower() == "readme.md":
+                  return "README-zed.md"
+              return re.sub(r"^README", "README-zed", name, count=1, flags=re.IGNORECASE)
+
+          def prepend_source_link(path: Path) -> None:
+              header = f"> Original source: [{repo} @ {ref}](https://github.com/{repo}/tree/{ref})\n\n"
+              try:
+                  body = path.read_text(encoding="utf-8")
+              except UnicodeDecodeError:
+                  body = path.read_text(errors="replace")
+              if not body.startswith(header):
+                  path.write_text(header + body, encoding="utf-8")
+
+          renamed_any = False
+          for src in sorted(root.iterdir()):
+              if not src.is_file() or pattern.match(src.name) is None:
+                  continue
+              if src.name.startswith("README-zed"):
+                  prepend_source_link(src)
+                  continue
+              dst = root / renamed(src.name)
+              print(f"Renaming original root {src.name} to {dst.name}")
+              if dst.exists():
+                  dst.unlink()
+              src.rename(dst)
+              prepend_source_link(dst)
+              renamed_any = True
+
+          if not renamed_any:
+              print("No root README.md or README.*.md found to rename")
+          PY
           }
 
           generate_files_by_date_markdown() {
@@ -1891,8 +1928,8 @@ jobs:
           CURRENT_STAGE="remove materialized exclusions"
           remove_materialized_exclusions "$OUT_DIR"
 
-          CURRENT_STAGE="rename root README"
-          rename_original_root_readme
+          CURRENT_STAGE="rename root README files"
+          rename_original_root_readmes
 
           CURRENT_STAGE="generate gpui_facade manifest"
           generate_gpui_facade_cargo_toml "$GPUI_METADATA_FILE"
