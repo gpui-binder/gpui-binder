@@ -743,13 +743,6 @@ jobs:
 
           crates = json.loads(os.environ["CRATES_JSON"])
           imported_packages = set(crates.keys())
-          root_dir = Path.cwd().resolve()
-
-          def display_path(path: Path) -> str:
-              try:
-                  return path.resolve().relative_to(root_dir).as_posix()
-              except Exception:
-                  return str(path).replace(os.sep, "/")
 
           SOURCE_SUFFIXES = {".rs"}
           SKIP_DIR_NAMES = {".git", "target", "node_modules"}
@@ -762,12 +755,38 @@ jobs:
           def markdown_cell(value) -> str:
               return str(value).replace("|", "\\|").replace("\n", "<br>")
 
+          def read_toml(path: Path) -> dict:
+              try:
+                  return tomllib.loads(path.read_text(encoding="utf-8"))
+              except Exception:
+                  return {}
+
           def package_name_for_manifest(cargo_toml: Path) -> str:
               try:
-                  data = tomllib.loads(cargo_toml.read_text())
+                  data = read_toml(cargo_toml)
                   return data.get("package", {}).get("name") or cargo_toml.parent.name
               except Exception:
                   return cargo_toml.parent.name
+
+          def machete_ignored_from_metadata(metadata: dict) -> set[str]:
+              if not isinstance(metadata, dict):
+                  return set()
+              machete = metadata.get("cargo-machete", {})
+              ignored = machete.get("ignored", []) if isinstance(machete, dict) else []
+              return {str(item) for item in ignored if isinstance(item, str)}
+
+          def workspace_machete_ignored_deps(root_data: dict) -> set[str]:
+              workspace = root_data.get("workspace", {}) if isinstance(root_data, dict) else {}
+              metadata = workspace.get("metadata", {}) if isinstance(workspace, dict) else {}
+              return machete_ignored_from_metadata(metadata)
+
+          def package_machete_ignored_deps(data: dict) -> set[str]:
+              package = data.get("package", {}) if isinstance(data, dict) else {}
+              metadata = package.get("metadata", {}) if isinstance(package, dict) else {}
+              return machete_ignored_from_metadata(metadata)
+
+          def effective_machete_ignored_deps(data: dict, workspace_ignored: set[str]) -> set[str]:
+              return set(workspace_ignored) | package_machete_ignored_deps(data)
 
           def section_header_name(header_line: str) -> str | None:
               match = re.match(r'^\s*\[([^\]]+)\]\s*$', header_line)
@@ -786,14 +805,20 @@ jobs:
                   yield name, match.start(), match.end(), body_start, section_end, text[body_start:section_end]
 
           def dependency_section_kind(section_name: str) -> str | None:
-              # Only package dependency sections are eligible. Do not treat
-              # [workspace.dependencies] or arbitrary metadata tables ending in
-              # `.dependencies` as member dependency lists.
-              if section_name == "dependencies" or (section_name.startswith("target.") and section_name.endswith(".dependencies")):
+              # Only real Cargo dependency sections are pruned.  Do not treat
+              # [workspace.dependencies] or metadata tables such as
+              # [package.metadata.foo.dependencies] as member dependencies.
+              if section_name == "dependencies" or (
+                  section_name.startswith("target.") and section_name.endswith(".dependencies")
+              ):
                   return "normal"
-              if section_name == "dev-dependencies" or (section_name.startswith("target.") and section_name.endswith(".dev-dependencies")):
+              if section_name == "dev-dependencies" or (
+                  section_name.startswith("target.") and section_name.endswith(".dev-dependencies")
+              ):
                   return "dev"
-              if section_name == "build-dependencies" or (section_name.startswith("target.") and section_name.endswith(".build-dependencies")):
+              if section_name == "build-dependencies" or (
+                  section_name.startswith("target.") and section_name.endswith(".build-dependencies")
+              ):
                   return "build"
               return None
 
@@ -823,10 +848,10 @@ jobs:
               stripped = line.strip()
               if not stripped or stripped.startswith("#"):
                   return None
-              # Return the dependency name, not the full dotted TOML path. This lets
-              # entries such as `serde.version = "1"` and `serde.features = [...]` be
-              # considered as one dependency and removed together only when safe.
-              match = re.match(r'^([A-Za-z0-9_-]+)\s*(?:=|\.)', stripped)
+              # Dependency keys cannot contain '.', but dotted dependency syntax can
+              # spell attributes as `foo.version = "1"` / `foo.workspace = true`.
+              # Return the dependency key (`foo`) for both regular and dotted entries.
+              match = re.match(r'^([A-Za-z0-9_-]+)(?:\s*=|\.)', stripped)
               if not match:
                   return None
               return match.group(1)
@@ -869,16 +894,6 @@ jobs:
                   flush()
               return entries
 
-          def dependency_values_from_section(section: str) -> dict:
-              # Parse the whole section when possible so dotted dependency entries split
-              # across multiple lines are evaluated with their full metadata.
-              try:
-                  data = tomllib.loads("[dependencies]\n" + section)
-                  deps = data.get("dependencies", {})
-                  return deps if isinstance(deps, dict) else {}
-              except Exception:
-                  return {}
-
           def dependency_value_from_entry(entry_text: str, dep_name: str):
               # tomllib gives reliable values for inline tables, dotted workspace entries,
               # simple strings, arrays, and multi-line tables.
@@ -901,44 +916,89 @@ jobs:
                       return body
               return ""
 
-          def metadata_ignored_deps(data: dict) -> set[str]:
-              metadata = data.get("package", {}).get("metadata", {})
-              machete = metadata.get("cargo-machete", {}) if isinstance(metadata, dict) else {}
-              ignored = machete.get("ignored", []) if isinstance(machete, dict) else []
-              return {str(item) for item in ignored if isinstance(item, str)}
 
-          MACRO_LIKE_FEATURE_NAMES = {
-              "derive",
-              "macros",
-              "macro",
-          }
+          def collect_feature_names(features_body: str) -> set[str]:
+              feature_names = set()
+              for key, _entry in parse_entries(features_body):
+                  if key is not None:
+                      feature_names.add(key.replace("-", "_"))
+              return feature_names
 
-          def dependency_has_macro_like_features(dep_name: str, value) -> bool:
-              dep_ident = dep_identifier(dep_name)
-              if any(part in dep_ident for part in ("derive", "macro")):
+          def feature_token_refs_dep(token: str, dep_name: str, feature_names: set[str] | None = None) -> bool:
+              normalized_token = token.replace("-", "_")
+              normalized_dep = dep_name.replace("-", "_")
+              if normalized_token == f"dep:{normalized_dep}":
                   return True
+              if normalized_token.startswith(f"{normalized_dep}/"):
+                  return True
+              if normalized_token.startswith(f"{normalized_dep}?/"):
+                  return True
+              # Cargo may use a bare optional-dependency feature reference such as
+              # default = ["opt-dep"].  If the optional dependency was pruned,
+              # remove that stale bare reference too.  Preserve it when a real
+              # feature named opt-dep still exists in [features].
+              if normalized_token == normalized_dep and normalized_dep not in (feature_names or set()):
+                  return True
+              return False
+
+          def dependency_is_feature_referenced(dep_name: str, features_text: str) -> bool:
+              if not features_text.strip():
+                  return False
+              feature_names = collect_feature_names(features_text)
+              for key, entry in parse_entries(features_text):
+                  if key is None:
+                      continue
+                  try:
+                      data = tomllib.loads("[features]\n" + entry)
+                      value = data.get("features", {}).get(key)
+                  except Exception:
+                      value = None
+                  if not isinstance(value, list):
+                      continue
+                  if any(feature_token_refs_dep(str(token), dep_name, feature_names) for token in value):
+                      return True
+              return False
+
+          MACRO_LIKE_DEP_KEYS = {
+              "serde", "serde_derive", "thiserror", "derive_more", "derive_new",
+              "derivative", "educe", "strum", "strum_macros", "schemars",
+              "clap", "enum_dispatch", "displaydoc", "num_enum", "enumflags2",
+              "typed_builder", "smart_default", "bon", "darling", "zerocopy",
+              "rkyv", "borsh", "yoke", "valuable", "wasm_bindgen",
+          }
+          MACRO_LIKE_FEATURE_HINTS = {"derive", "macro", "macros", "proc-macro", "proc_macro"}
+
+          def dependency_has_macro_like_features(value) -> bool:
               if not isinstance(value, dict):
                   return False
               features = value.get("features", [])
               if not isinstance(features, list):
                   return False
-              for feature in features:
-                  feature_ident = str(feature).replace("-", "_")
-                  if feature_ident in MACRO_LIKE_FEATURE_NAMES:
-                      return True
-                  if feature_ident.endswith("_derive") or feature_ident.endswith("_macros") or feature_ident.endswith("_macro"):
-                      return True
+              lowered = {str(feature).replace("_", "-").lower() for feature in features}
+              return any(any(hint in feature for hint in MACRO_LIKE_FEATURE_HINTS) for feature in lowered)
+
+          def dependency_may_be_macro_only(dep_name: str, value, searchable_text: str) -> bool:
+              normalized_dep = dep_name.replace("-", "_")
+              package_name = value.get("package") if isinstance(value, dict) else None
+              normalized_package = str(package_name).replace("-", "_") if package_name else ""
+              has_macro_syntax = "#[" in searchable_text or "macro_rules!" in searchable_text
+              if not has_macro_syntax:
+                  return False
+              if dependency_has_macro_like_features(value):
+                  return True
+              if normalized_dep in MACRO_LIKE_DEP_KEYS or normalized_package in MACRO_LIKE_DEP_KEYS:
+                  return True
               return False
 
-          def feature_token_refs_dep(token: str, dep_name: str) -> bool:
-              normalized_dep = dep_identifier(dep_name)
-              token = str(token)
-              if token.startswith("dep:"):
-                  return dep_identifier(token[len("dep:"):]) == normalized_dep
-              head = token.split("/", 1)[0]
-              if head.endswith("?"):
-                  head = head[:-1]
-              return "/" in token and dep_identifier(head) == normalized_dep
+          def package_uses_generated_rust(searchable_text: str) -> bool:
+              generated_markers = (
+                  'OUT_DIR',
+                  'include_proto!',
+                  'include_file_descriptor_set!',
+                  'include!(concat!(env!("OUT_DIR"',
+                  "include!(concat!(env!('OUT_DIR'",
+              )
+              return any(marker in searchable_text for marker in generated_markers)
 
           def render_feature_entry(feature_name: str, tokens: list[str]) -> str:
               rendered_tokens = ", ".join(json.dumps(token) for token in tokens)
@@ -951,6 +1011,7 @@ jobs:
               for name, _header_start, _header_end, body_start, section_end, body in iter_sections(manifest_text):
                   if name != "features":
                       continue
+                  feature_names = collect_feature_names(body)
                   rebuilt = []
                   changed = False
                   for key, entry in parse_entries(body):
@@ -967,7 +1028,7 @@ jobs:
                           continue
                       filtered = [
                           token for token in value
-                          if not any(feature_token_refs_dep(str(token), dep_name) for dep_name in removed_dep_names)
+                          if not any(feature_token_refs_dep(str(token), dep_name, feature_names) for dep_name in removed_dep_names)
                       ]
                       if filtered == value:
                           rebuilt.append(entry)
@@ -984,11 +1045,7 @@ jobs:
               for path in sorted(package_dir.rglob("*")):
                   if not path.is_file() or path.suffix not in SOURCE_SUFFIXES:
                       continue
-                  try:
-                      relative_parts = path.relative_to(package_dir).parts
-                  except ValueError:
-                      relative_parts = path.parts
-                  if any(part in SKIP_DIR_NAMES for part in relative_parts):
+                  if any(part in SKIP_DIR_NAMES for part in path.parts):
                       continue
                   try:
                       chunks.append(path.read_text(errors="ignore"))
@@ -1002,19 +1059,6 @@ jobs:
           def identifier_is_referred(dep_name: str, searchable_text: str) -> bool:
               ident = dep_identifier(dep_name)
               return re.search(rf'(?<![A-Za-z0-9_]){re.escape(ident)}(?![A-Za-z0-9_])', searchable_text) is not None
-
-          def package_may_include_generated_rust(searchable_text: str) -> bool:
-              # Generated Rust included from OUT_DIR, or proto include macros, can refer
-              # to normal dependencies that do not appear in handwritten .rs files. In
-              # that case we keep the package's normal deps rather than risk deleting a
-              # dependency used only by generated code.
-              if "OUT_DIR" in searchable_text and re.search(r'(?<![A-Za-z0-9_])include!\s*\(', searchable_text):
-                  return True
-              if re.search(r'(?<![A-Za-z0-9_])include_proto!\s*\(', searchable_text):
-                  return True
-              if re.search(r'(?<![A-Za-z0-9_])include_file_descriptor_set!\s*\(', searchable_text):
-                  return True
-              return False
 
           def remove_deps_from_sections(manifest_text: str, remove_by_section: dict[tuple[int, int], set[str]]) -> str:
               replacements = []
@@ -1032,6 +1076,9 @@ jobs:
                   manifest_text = manifest_text[:body_start] + new_body + manifest_text[section_end:]
               return manifest_text
 
+          root_data = read_toml(Path("Cargo.toml")) if Path("Cargo.toml").is_file() else {}
+          workspace_ignored_deps = workspace_machete_ignored_deps(root_data)
+
           removed_rows = []
           kept_rows = []
 
@@ -1040,66 +1087,51 @@ jobs:
               for cargo_toml in sorted(target.rglob("Cargo.toml")):
                   package_dir = cargo_toml.parent
                   manifest_text = cargo_toml.read_text()
-                  manifest_data = tomllib.loads(manifest_text)
-                  ignored_deps = metadata_ignored_deps(manifest_data)
+                  features_text = extract_features_text(manifest_text)
                   searchable = source_search_text(package_dir)
-                  may_include_generated_rust = package_may_include_generated_rust(searchable)
+                  uses_generated_rust = package_uses_generated_rust(searchable)
                   remove_by_section = {}
                   package_name = package_name_for_manifest(cargo_toml)
+                  ignored_deps = effective_machete_ignored_deps(read_toml(cargo_toml), workspace_ignored_deps)
 
                   for section_name, _header_start, _header_end, body_start, section_end, body in iter_sections(manifest_text):
                       kind = dependency_section_kind(section_name)
                       if kind != "normal":
                           continue
 
-                      section_values = dependency_values_from_section(body)
                       for dep_name, entry_text in parse_entries(body):
                           if dep_name is None:
                               continue
-                          value = section_values.get(dep_name)
-                          if value is None:
-                              value = dependency_value_from_entry(entry_text, dep_name)
+                          value = dependency_value_from_entry(entry_text, dep_name)
+                          if dep_name in imported_packages or dep_name in PROTECTED_DEP_KEYS or dep_name in ignored_deps:
+                              continue
                           if value is None:
                               continue
-
-                          keep_reason = None
-                          if dep_name in imported_packages:
-                              keep_reason = "imported local package dependency"
-                          elif dep_name in PROTECTED_DEP_KEYS:
-                              keep_reason = "protected generated dependency"
-                          elif dep_name in ignored_deps:
-                              keep_reason = "cargo-machete ignored dependency"
-                          elif dependency_has_macro_like_features(dep_name, value):
-                              keep_reason = "macro/derive-like dependency"
-
-                          if keep_reason is not None:
+                          if uses_generated_rust:
                               kept_rows.append({
                                   "package": package_name,
-                                  "manifest": display_path(cargo_toml),
+                                  "manifest": str(cargo_toml).replace(os.sep, "/"),
                                   "section": section_name,
                                   "dependency": dep_name,
-                                  "searched": dep_identifier(dep_name),
-                                  "reason": keep_reason,
+                                  "reason": "member includes generated Rust from OUT_DIR/protobuf macros",
                               })
                               continue
-
+                          if dependency_may_be_macro_only(dep_name, value, searchable):
+                              kept_rows.append({
+                                  "package": package_name,
+                                  "manifest": str(cargo_toml).replace(os.sep, "/"),
+                                  "section": section_name,
+                                  "dependency": dep_name,
+                                  "reason": "dependency may be used only through derives or procedural macros",
+                              })
+                              continue
                           if identifier_is_referred(dep_name, searchable):
-                              continue
-                          if may_include_generated_rust:
-                              kept_rows.append({
-                                  "package": package_name,
-                                  "manifest": display_path(cargo_toml),
-                                  "section": section_name,
-                                  "dependency": dep_name,
-                                  "searched": dep_identifier(dep_name),
-                                  "reason": "package includes generated Rust; kept conservatively because identifier was not found in handwritten sources",
-                              })
                               continue
 
                           remove_by_section.setdefault((body_start, section_end), set()).add(dep_name)
                           removed_rows.append({
                               "package": package_name,
-                              "manifest": display_path(cargo_toml),
+                              "manifest": str(cargo_toml).replace(os.sep, "/"),
                               "section": section_name,
                               "dependency": dep_name,
                               "searched": dep_identifier(dep_name),
@@ -1119,8 +1151,8 @@ jobs:
                   summary.write("\n### Imported member dependency pruning\n")
                   summary.write(
                       "Rule: for normal imported member dependencies, convert the dependency key `-` to `_` "
-                      "and remove the dependency only when that identifier is not found in the member Rust sources "
-                      "and no conservative keep rule applies. Build/dev, imported local package, gpui, assets bridge, cargo-machete ignored, macro/derive-like, and generated-Rust include packages are kept. `optional = true` and feature-referenced dependencies are still checked against all member Rust source files; they are kept when the normalized dependency key appears anywhere in those `.rs` files, including tests/examples/benches/build.rs, and pruned only when it is not found. Related dep: or dep/feature references are cleaned from feature lists after pruning.\n\n"
+                      "and remove the dependency when that identifier is not found in the member Rust sources. "
+                      "Build/dev, imported local package, gpui, assets bridge, package/workspace cargo-machete ignored, macro/derive-like, and generated-Rust dependencies are kept. Optional and feature-referenced dependencies are pruned when their dependency key is not found in Rust sources; stale dep:, dep/feature, weak dep?/feature, and bare optional-dependency feature refs are removed while real feature-to-feature refs are preserved.\n\n"
                   )
                   if removed_rows:
                       summary.write("| Package | Manifest | Section | Removed dependency | Searched identifier | Reason |\n")
@@ -1145,32 +1177,6 @@ jobs:
                           summary.write(f"\nOnly the first 160 removed dependency rows are shown out of {len(removed_rows)}.\n")
                   else:
                       summary.write("No unused normal member dependencies were pruned.\n")
-
-                  conservative_rows = [row for row in kept_rows if row["reason"] != "imported local package dependency"]
-                  if conservative_rows:
-                      summary.write("\n#### Dependencies kept by conservative rule\n\n")
-                      summary.write("These are not removed even when the normalized dependency key is not enough to prove normal source usage. They are shown to make future pruning decisions easier to audit.\n\n")
-                      summary.write("| Package | Manifest | Section | Kept dependency | Searched identifier | Reason |\n")
-                      summary.write("|---|---|---|---|---|---|\n")
-                      for row in conservative_rows[:160]:
-                          summary.write(
-                              "| "
-                              + markdown_cell(row["package"])
-                              + " | `"
-                              + markdown_cell(row["manifest"])
-                              + "` | `"
-                              + markdown_cell(row["section"])
-                              + "` | `"
-                              + markdown_cell(row["dependency"])
-                              + "` | `"
-                              + markdown_cell(row["searched"])
-                              + "` | "
-                              + markdown_cell(row["reason"])
-                              + " |\n"
-                          )
-                      if len(conservative_rows) > 160:
-                          summary.write(f"\nOnly the first 160 conservative keep rows are shown out of {len(conservative_rows)}.\n")
-
       - name: Patch root workspace Cargo.toml
         env:
           CRATES_JSON: ${{ steps.detect.outputs.crates_json }}
@@ -2834,7 +2840,21 @@ jobs:
                       if candidate.exists() and candidate not in visited_manifests:
                           queue.append(candidate)
 
-          unused_workspace_deps = set(workspace_deps) - used_workspace_deps
+          def machete_ignored_from_metadata(metadata: dict) -> set[str]:
+              if not isinstance(metadata, dict):
+                  return set()
+              machete = metadata.get("cargo-machete", {})
+              ignored = machete.get("ignored", []) if isinstance(machete, dict) else []
+              return {str(item) for item in ignored if isinstance(item, str)}
+
+          workspace_metadata = workspace.get("metadata", {}) if isinstance(workspace, dict) else {}
+          ignored_workspace_deps = machete_ignored_from_metadata(workspace_metadata)
+
+          unused_workspace_deps = set(workspace_deps) - used_workspace_deps - ignored_workspace_deps
+          if ignored_workspace_deps:
+              print("Keeping workspace cargo-machete ignored dependencies:")
+              for name in sorted(ignored_workspace_deps & set(workspace_deps)):
+                  print(f"  {name}")
           if not unused_workspace_deps:
               print("No unused root [workspace.dependencies] entries found.")
               raise SystemExit(0)
