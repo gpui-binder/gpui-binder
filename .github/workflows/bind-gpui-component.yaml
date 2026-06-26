@@ -587,6 +587,20 @@ jobs:
                   return out
               return {"__name": dep_name}
 
+          def dependency_entry_table(entry: str, dep_name: str):
+              try:
+                  parsed = tomllib.loads("[dependencies]\n" + entry + "\n")
+                  value = parsed.get("dependencies", {}).get(dep_name)
+              except Exception:
+                  value = None
+              if isinstance(value, str):
+                  return {"version": value, "__name": dep_name}
+              if isinstance(value, dict):
+                  out = dict(value)
+                  out["__name"] = dep_name
+                  return out
+              return {"__name": dep_name}
+
           def entry_override_kind(entry: str):
               value = dependency_table(entry)
               if isinstance(value.get("path"), str):
@@ -607,15 +621,34 @@ jobs:
                   value.get("version"),
               )
 
-          def features(value: dict) -> set[str]:
+          def ordered_features(value: dict) -> list[str]:
               raw = value.get("features", [])
-              return set(raw) if isinstance(raw, list) else set()
+              if not isinstance(raw, list):
+                  return []
+              out = []
+              seen = set()
+              for feature in raw:
+                  if not isinstance(feature, str) or feature in seen:
+                      continue
+                  out.append(feature)
+                  seen.add(feature)
+              return out
+
+          def feature_set(value: dict) -> set[str]:
+              return set(ordered_features(value))
 
           def default_features(value: dict) -> bool:
               raw = value.get("default-features")
               return True if raw is None else bool(raw)
 
-          def target_workspace_override_satisfies_source(source_entry: str, target_entry: str) -> bool:
+          def target_workspace_dep_is_inheritable(source_entry: str, target_entry: str) -> bool:
+              """Return whether imported manifests may keep dep = { workspace = true }.
+
+              This checks dependency *identity* and non-additive behavior. Feature
+              differences are handled separately by adding missing source features
+              to the member dependency line, because workspace and member features
+              are additive.
+              """
               source_kind = entry_override_kind(source_entry)
               target_kind = entry_override_kind(target_entry)
 
@@ -625,41 +658,93 @@ jobs:
               if source_kind == "path" or target_kind == "path":
                   return False
 
-              if source_kind != "git" or target_kind != "git":
-                  return False
-
               source_value = dependency_table(source_entry)
               target_value = dependency_table(target_entry)
-              if git_identity(source_value) != git_identity(target_value):
-                  return False
 
-              # Workspace dependency features are additive, so a target entry with
-              # all source-required features is safe. Default feature state is not
-              # additive; it must match to avoid changing behavior silently.
-              if not features(source_value).issubset(features(target_value)):
-                  return False
+              # Git dependencies must point at the same repo/ref/package/version.
+              # Otherwise workspace inheritance would silently switch sources.
+              if source_kind == "git" or target_kind == "git":
+                  if source_kind != "git" or target_kind != "git":
+                      return False
+                  if git_identity(source_value) != git_identity(target_value):
+                      return False
+
+              # default-features is not additive like features. If the source and
+              # target disagree, expand locally rather than silently changing the
+              # imported package's default feature behavior.
               if default_features(source_value) != default_features(target_value):
                   return False
 
               return True
+
+          def missing_workspace_features(source_entry: str, target_entry: str) -> list[str]:
+              source_value = dependency_table(source_entry)
+              target_value = dependency_table(target_entry)
+              target_features = feature_set(target_value)
+              return [
+                  feature
+                  for feature in ordered_features(source_value)
+                  if feature not in target_features
+              ]
 
           def should_expand_source_workspace_dep(dep_name: str, source_entry: str) -> bool:
               target_entry = target_workspace_deps.get(dep_name)
               if not target_entry:
                   return True
 
-              # Ordinary crates.io workspace entries are intentionally inherited
-              # from the generated Zed workspace, even if versions differ; that is
-              # the centralization/alignment we want.
-              if not entry_override_kind(target_entry):
-                  return False
+              # Inherit target workspace dependencies whenever that is semantically
+              # safe. For normal crates.io dependencies, this deliberately aligns
+              # the imported package to the generated Zed workspace version/source.
+              return not target_workspace_dep_is_inheritable(source_entry, target_entry)
 
-              # For target git/path overrides, expand only when the target override
-              # is not the same source dependency the imported package expected.
-              # This keeps cases like reqwest.workspace = true when both roots point
-              # to the same zed-reqwest revision, while still protecting cases like
-              # lsp-types where Zed and gpui-component intentionally differ.
-              return not target_workspace_override_satisfies_source(source_entry, target_entry)
+          def render_toml_value(value):
+              if isinstance(value, bool):
+                  return "true" if value else "false"
+              if isinstance(value, str):
+                  return json.dumps(value)
+              if isinstance(value, list) and all(isinstance(item, str) for item in value):
+                  return "[" + ", ".join(json.dumps(item) for item in value) + "]"
+              return None
+
+          def render_dependency_line(dep_name: str, value: dict, indent: str = "") -> str:
+              order = [
+                  "workspace",
+                  "version",
+                  "path",
+                  "git",
+                  "rev",
+                  "tag",
+                  "branch",
+                  "package",
+                  "default-features",
+                  "features",
+                  "optional",
+              ]
+              parts = []
+              emitted = set()
+              for key in order:
+                  if key in value:
+                      rendered = render_toml_value(value[key])
+                      if rendered is not None:
+                          parts.append(f"{key} = {rendered}")
+                          emitted.add(key)
+              for key in sorted(k for k in value if k not in emitted and not k.startswith("__")):
+                  rendered = render_toml_value(value[key])
+                  if rendered is not None:
+                      parts.append(f"{key} = {rendered}")
+              if not parts:
+                  return f"{indent}{dep_name}.workspace = true"
+              return f"{indent}{dep_name} = {{ " + ", ".join(parts) + " }"
+
+          def merge_ordered_features(*feature_lists: list[str]) -> list[str]:
+              out = []
+              seen = set()
+              for feature_list in feature_lists:
+                  for feature in feature_list:
+                      if feature not in seen:
+                          out.append(feature)
+                          seen.add(feature)
+              return out
 
           local_packages = {}
           for cargo_toml in Path("crates").glob("*/Cargo.toml"):
@@ -671,58 +756,117 @@ jobs:
               if name:
                   local_packages[name] = cargo_toml.parent
 
-          def rewrite_zed_git_dependency_to_local_for_manifest(entry: str, manifest: Path) -> str:
-              if "github.com/zed-industries/" not in entry:
-                  return entry
+          def source_dependency_value_for_manifest(source_entry: str, dep_name: str, manifest: Path) -> dict:
+              source_value = dependency_table(source_entry)
+              value = {
+                  key: val
+                  for key, val in source_value.items()
+                  if not key.startswith("__")
+              }
 
-              match = re.match(r'^\s*([A-Za-z0-9_\-]+)\s*=\s*\{(.*)\}\s*$', entry, re.S)
-              if not match:
-                  return entry
+              git_url = value.get("git")
+              package_name = value.get("package", dep_name)
+              if isinstance(git_url, str) and "github.com/zed-industries/" in git_url:
+                  local_path = local_packages.get(package_name)
+                  if local_path:
+                      relative_path = os.path.relpath(local_path, manifest.parent).replace(os.sep, "/")
+                      value = {
+                          key: val
+                          for key, val in value.items()
+                          if key not in {"git", "rev", "tag", "branch", "version"}
+                      }
+                      value["path"] = relative_path
+                      if package_name != dep_name:
+                          value["package"] = package_name
+                      print(f"Rewrote {dep_name} for {manifest}: zed-industries git -> {relative_path}")
+                  else:
+                      print(f"No local Zed package for {dep_name} / {package_name}; keeping source dependency.")
 
-              dep_name = match.group(1)
-              body = match.group(2)
+              return value
 
-              package_match = re.search(r'package\s*=\s*"([^"]+)"', body)
-              package_name = package_match.group(1) if package_match else dep_name
+          def expanded_dependency_line(dep_name: str, source_entry: str, original_entry: str, manifest: Path) -> str:
+              indent_match = re.match(r'^(\s*)', original_entry)
+              indent = indent_match.group(1) if indent_match else ""
+              value = source_dependency_value_for_manifest(source_entry, dep_name, manifest)
+              original_value = dependency_entry_table(original_entry, dep_name)
 
-              local_path = local_packages.get(package_name)
-              if not local_path:
-                  print(f"No local Zed package for {dep_name} / {package_name}; keeping source dependency.")
-                  return entry
-
-              relative_path = os.path.relpath(local_path, manifest.parent).replace(os.sep, "/")
-
-              preserved = []
-              if package_name != dep_name:
-                  preserved.append(f'package = "{package_name}"')
-
-              for key in ("features",):
-                  m = re.search(rf'{key}\s*=\s*\[([^\]]*)\]', body, re.S)
-                  if m:
-                      preserved.append(f"{key} = [" + m.group(1).strip() + "]")
-
-              for key in ("default-features", "optional"):
-                  m = re.search(rf'{key}\s*=\s*(true|false)', body)
-                  if m:
-                      preserved.append(f"{key} = {m.group(1)}")
-
-              parts = [f'path = "{relative_path}"'] + preserved
-              rewritten = f'{dep_name} = {{ ' + ", ".join(parts) + " }"
-              print(f"Rewrote {dep_name} for {manifest}: zed-industries git -> {relative_path}")
-              return rewritten
-
-          def replace_workspace_dep_line(text: str, dep_name: str, replacement: str) -> str:
-              text = re.sub(
-                  rf'(?m)^\s*{re.escape(dep_name)}\.workspace\s*=\s*true\s*$',
-                  replacement,
-                  text,
+              merged_features = merge_ordered_features(
+                  ordered_features(value),
+                  ordered_features(original_value),
               )
-              text = re.sub(
-                  rf'(?m)^\s*{re.escape(dep_name)}\s*=\s*\{{[^\n]*workspace\s*=\s*true[^\n]*\}}\s*$',
-                  replacement,
-                  text,
+              if merged_features:
+                  value["features"] = merged_features
+              elif "features" in value:
+                  value.pop("features", None)
+
+              if "optional" in original_value:
+                  value["optional"] = original_value["optional"]
+              if "default-features" in original_value:
+                  value["default-features"] = original_value["default-features"]
+
+              return render_dependency_line(dep_name, value, indent)
+
+          def inherited_dependency_line(dep_name: str, original_entry: str, extra_features: list[str]) -> str:
+              if not extra_features:
+                  return original_entry
+              indent_match = re.match(r'^(\s*)', original_entry)
+              indent = indent_match.group(1) if indent_match else ""
+              value = dependency_entry_table(original_entry, dep_name)
+              if value.get("workspace") is not True:
+                  return original_entry
+
+              merged_features = merge_ordered_features(
+                  ordered_features(value),
+                  extra_features,
               )
-              return text
+              value = {
+                  key: val
+                  for key, val in value.items()
+                  if not key.startswith("__")
+              }
+              value["workspace"] = True
+              value["features"] = merged_features
+
+              # Keep the workspace flag first for readability.
+              ordered = {"workspace": True}
+              for key, val in value.items():
+                  if key != "workspace":
+                      ordered[key] = val
+              return render_dependency_line(dep_name, ordered, indent)
+
+          def rewrite_workspace_dependency_entries(text: str, dep_name: str, rewriter) -> str:
+              lines = text.splitlines(keepends=True)
+              out = []
+              i = 0
+              start_re = re.compile(
+                  rf'^(\s*){re.escape(dep_name)}(?:\.workspace\s*=\s*true|\s*=\s*\{{.*workspace\s*=\s*true)',
+                  re.S,
+              )
+              while i < len(lines):
+                  line = lines[i]
+                  if not start_re.match(line):
+                      out.append(line)
+                      i += 1
+                      continue
+
+                  entry_lines = [line.rstrip("\n")]
+                  code = line.split("#", 1)[0]
+                  depth_curly = code.count("{") - code.count("}")
+                  depth_square = code.count("[") - code.count("]")
+                  i += 1
+                  while i < len(lines) and (depth_curly > 0 or depth_square > 0):
+                      next_line = lines[i]
+                      entry_lines.append(next_line.rstrip("\n"))
+                      code = next_line.split("#", 1)[0]
+                      depth_curly += code.count("{") - code.count("}")
+                      depth_square += code.count("[") - code.count("]")
+                      i += 1
+
+                  original_entry = "\n".join(entry_lines)
+                  replacement = rewriter(original_entry)
+                  out.append(replacement + ("\n" if line.endswith("\n") else ""))
+
+              return "".join(out)
 
           for item in crates.values():
               target = Path(item["target"])
@@ -733,13 +877,25 @@ jobs:
                   for dep_name, source_entry in source_deps.items():
                       if dep_name in imported_packages:
                           continue
-                      if not should_expand_source_workspace_dep(dep_name, source_entry):
+
+                      target_entry = target_workspace_deps.get(dep_name)
+                      if should_expand_source_workspace_dep(dep_name, source_entry):
+                          text = rewrite_workspace_dependency_entries(
+                              text,
+                              dep_name,
+                              lambda original_entry, dep_name=dep_name, source_entry=source_entry, cargo_toml=cargo_toml:
+                                  expanded_dependency_line(dep_name, source_entry, original_entry, cargo_toml),
+                          )
                           continue
-                      replacement = rewrite_zed_git_dependency_to_local_for_manifest(
-                          source_entry,
-                          cargo_toml,
-                      )
-                      text = replace_workspace_dep_line(text, dep_name, replacement)
+
+                      extra_features = missing_workspace_features(source_entry, target_entry)
+                      if extra_features:
+                          text = rewrite_workspace_dependency_entries(
+                              text,
+                              dep_name,
+                              lambda original_entry, dep_name=dep_name, extra_features=extra_features:
+                                  inherited_dependency_line(dep_name, original_entry, extra_features),
+                          )
 
                   if text != original:
                       cargo_toml.write_text(text)
