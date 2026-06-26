@@ -1203,13 +1203,13 @@ jobs:
               return out
 
           def ensure_workspace_table(text: str) -> str:
-              if re.search(r'(?m)^\[workspace\]\s*$', text):
+              if re.search(r'(?m)^[^\S\r\n]*\[workspace\][^\S\r\n]*$', text):
                   return text
               suffix = "" if text.endswith("\n") else "\n"
               return text + suffix + "\n[workspace]\n"
 
           def workspace_bounds(text: str):
-              match = re.search(r'(?ms)^\[workspace\]\s*(.*?)(?=^\[|\Z)', text)
+              match = re.search(r'(?ms)^[^\S\r\n]*\[workspace\][^\S\r\n]*(?:\r?\n)?(.*?)(?=^[^\S\r\n]*\[|\Z)', text)
               if not match:
                   raise SystemExit("Could not find [workspace] table")
               return match.start(), match.end(), match.group(0)
@@ -1231,20 +1231,20 @@ jobs:
               if match:
                   return block[:match.start()] + replacement + block[match.end():]
 
-              header = re.search(r'(?m)^\[workspace\]\s*$', block)
+              header = re.search(r'(?m)^[^\S\r\n]*\[workspace\][^\S\r\n]*$', block)
               if not header:
                   raise SystemExit("Could not find [workspace] header")
               insert_at = header.end()
               return block[:insert_at] + "\n" + replacement + "\n" + block[insert_at:]
 
           def section_bounds(text: str, section_name: str):
-              header = re.search(rf'(?m)^\[{re.escape(section_name)}\][^\S\r\n]*$', text)
+              header = re.search(rf'(?m)^[^\S\r\n]*\[{re.escape(section_name)}\][^\S\r\n]*$', text)
               if not header:
                   return None
               body_start = header.end()
               if body_start < len(text) and text[body_start] == "\n":
                   body_start += 1
-              next_header = re.search(r'(?m)^\[', text[body_start:])
+              next_header = re.search(r'(?m)^[^\S\r\n]*\[', text[body_start:])
               section_end = body_start + next_header.start() if next_header else len(text)
               return header.start(), header.end(), body_start, section_end
 
@@ -1363,7 +1363,7 @@ jobs:
 
           def extract_section(text: str, section_name: str) -> str:
               match = re.search(
-                  rf'(?ms)^\[{re.escape(section_name)}\]\s*(.*?)(?=^\[|\Z)',
+                  rf'(?ms)^[^\S\r\n]*\[{re.escape(section_name)}\][^\S\r\n]*(?:\r?\n)?(.*?)(?=^[^\S\r\n]*\[|\Z)',
                   text,
               )
               return match.group(1) if match else ""
@@ -1726,7 +1726,7 @@ jobs:
               ))
 
           def iter_dependency_sections(text: str):
-              headers = list(re.finditer(r'(?m)^\[([^\]]+)\][^\S\r\n]*$', text))
+              headers = list(re.finditer(r'(?m)^[^\S\r\n]*\[([^\]]+)\][^\S\r\n]*$', text))
               for index, header in enumerate(headers):
                   name = header.group(1)
                   if not dependency_section_header(name):
@@ -1795,13 +1795,13 @@ jobs:
               return rewrite_dependency_entries_in_dependency_sections(text, dep_name, only_workspace)
 
           def replace_workspace_dependency_entry(text: str, dep_name: str, replacement_entry: str) -> tuple[str, int]:
-              match = re.search(r'(?m)^\[workspace\.dependencies\][^\S\r\n]*$', text)
+              match = re.search(r'(?m)^[^\S\r\n]*\[workspace\.dependencies\][^\S\r\n]*$', text)
               if not match:
                   return text, 0
               body_start = match.end()
               if body_start < len(text) and text[body_start] == "\n":
                   body_start += 1
-              next_header = re.search(r'(?m)^\[', text[body_start:])
+              next_header = re.search(r'(?m)^[^\S\r\n]*\[', text[body_start:])
               section_end = body_start + next_header.start() if next_header else len(text)
               section = text[body_start:section_end]
               new_section, replaced = rewrite_named_entries_in_section(
@@ -2302,8 +2302,8 @@ jobs:
                   text = toml.read_text()
                   original = text
 
-                  text = re.sub(r'(?ms)^\[workspace\]\s*.*?(?=^\[|\Z)', '', text)
-                  text = re.sub(r'(?ms)^\[workspace\.dependencies\]\s*.*?(?=^\[|\Z)', '', text)
+                  text = re.sub(r'(?ms)^[^\S\r\n]*\[workspace\][^\S\r\n]*(?:\r?\n)?.*?(?=^[^\S\r\n]*\[|\Z)', '', text)
+                  text = re.sub(r'(?ms)^[^\S\r\n]*\[workspace\.dependencies\][^\S\r\n]*(?:\r?\n)?.*?(?=^[^\S\r\n]*\[|\Z)', '', text)
 
                   if text != original:
                       toml.write_text(text)
@@ -2481,13 +2481,13 @@ jobs:
               )
 
           def section_bounds(text: str, section_name: str):
-              header = re.search(rf'(?m)^\[{re.escape(section_name)}\][^\S\r\n]*$', text)
+              header = re.search(rf'(?m)^[^\S\r\n]*\[{re.escape(section_name)}\][^\S\r\n]*$', text)
               if not header:
                   return None
               body_start = header.end()
               if body_start < len(text) and text[body_start] == "\n":
                   body_start += 1
-              next_header = re.search(r'(?m)^\[', text[body_start:])
+              next_header = re.search(r'(?m)^[^\S\r\n]*\[', text[body_start:])
               section_end = body_start + next_header.start() if next_header else len(text)
               return header.start(), header.end(), body_start, section_end
 
@@ -2499,7 +2499,7 @@ jobs:
 
           def dependency_section_names(text: str) -> list[str]:
               names = []
-              for match in re.finditer(r'(?m)^\[([^\]]+)\][^\S\r\n]*$', text):
+              for match in re.finditer(r'(?m)^[^\S\r\n]*\[([^\]]+)\][^\S\r\n]*$', text):
                   name = match.group(1)
                   if name == "workspace.dependencies":
                       continue
@@ -2712,7 +2712,7 @@ jobs:
                   'inspector = ["gpui/inspector"]',
               )
               text = re.sub(
-                  r"(?ms)^\[target\.'cfg\(target_family = \"wasm\"\)'\.dependencies\]\s*(?=^\[|\Z)",
+                  r"(?ms)^[^\S\r\n]*\[target\.'cfg\(target_family = \"wasm\"\)'\.dependencies\][^\S\r\n]*(?:\r?\n)?(?=^[^\S\r\n]*\[|\Z)",
                   "",
                   text,
               )
@@ -2860,13 +2860,13 @@ jobs:
               raise SystemExit(0)
 
           def section_bounds(text: str, section_name: str):
-              header = re.search(rf'(?m)^\[{re.escape(section_name)}\][^\S\r\n]*$', text)
+              header = re.search(rf'(?m)^[^\S\r\n]*\[{re.escape(section_name)}\][^\S\r\n]*$', text)
               if not header:
                   return None
               body_start = header.end()
               if body_start < len(text) and text[body_start] == "\n":
                   body_start += 1
-              next_header = re.search(r'(?m)^\[', text[body_start:])
+              next_header = re.search(r'(?m)^[^\S\r\n]*\[', text[body_start:])
               section_end = body_start + next_header.start() if next_header else len(text)
               return body_start, section_end
 

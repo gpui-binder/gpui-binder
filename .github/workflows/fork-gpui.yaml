@@ -723,7 +723,7 @@ jobs:
 
           text = src.read_text()
 
-          match = re.search(r"(?ms)^\[package\]\n(.*?)(?=^\[)", text)
+          match = re.search(r"(?ms)^[^\S\r\n]*\[package\][^\S\r\n]*(?:\r?\n)(.*?)(?=^[^\S\r\n]*\[|\Z)", text)
           if not match:
               raise SystemExit("Could not find [package] section in crates/gpui/Cargo.toml")
 
@@ -918,7 +918,7 @@ jobs:
               return tomllib.loads(path.read_text(encoding="utf-8"))
 
           def section_body(text: str, section: str) -> tuple[int, int, str]:
-              match = re.search(rf"(?ms)^\[{re.escape(section)}\]\s*(.*?)(?=^\[|\Z)", text)
+              match = re.search(rf"(?ms)^[^\S\r\n]*\[{re.escape(section)}\][^\S\r\n]*(?:\r?\n)?(.*?)(?=^[^\S\r\n]*\[|\Z)", text)
               if not match:
                   raise SystemExit(f"Could not find [{section}] section")
               return match.start(1), match.end(1), match.group(1)
@@ -1326,7 +1326,7 @@ jobs:
           def is_workspace_path(value: str) -> bool:
               return value.startswith(WORKSPACE_PREFIXES)
 
-          workspace_match = re.search(r"(?ms)^\[workspace\]\s*(.*?)(?=^\[|\Z)", text)
+          workspace_match = re.search(r"(?ms)^[^\S\r\n]*\[workspace\][^\S\r\n]*(?:\r?\n)?(.*?)(?=^[^\S\r\n]*\[|\Z)", text)
           if not workspace_match:
               raise SystemExit("Could not find [workspace] table in root Cargo.toml")
 
@@ -1387,7 +1387,7 @@ jobs:
                   return block[:match.start()] + replacement + block[match.end():]
 
               # Insert missing arrays near the top of [workspace].
-              header_match = re.search(r"(?m)^\[workspace\]\s*$", block)
+              header_match = re.search(r"(?m)^[^\S\r\n]*\[workspace\][^\S\r\n]*$", block)
               if not header_match:
                   raise SystemExit("Could not find [workspace] header while writing array")
 
@@ -1851,7 +1851,7 @@ jobs:
               return manifest_text
 
           def read_workspace_members(root_text: str) -> list[str]:
-              match = re.search(r'(?ms)^\[workspace\]\s*(.*?)(?=^\[|\Z)', root_text)
+              match = re.search(r'(?ms)^[^\S\r\n]*\[workspace\][^\S\r\n]*(?:\r?\n)?(.*?)(?=^[^\S\r\n]*\[|\Z)', root_text)
               if not match:
                   return []
               body = match.group(1)
@@ -2068,7 +2068,7 @@ jobs:
                   return {}
 
           def section_body(text: str, section: str) -> str:
-              match = re.search(rf"(?ms)^\[{re.escape(section)}\]\s*(.*?)(?=^\[|\Z)", text)
+              match = re.search(rf"(?ms)^[^\S\r\n]*\[{re.escape(section)}\][^\S\r\n]*(?:\r?\n)?(.*?)(?=^[^\S\r\n]*\[|\Z)", text)
               return match.group(1) if match else ""
 
           def feature_key_order(path: Path) -> list[str]:
