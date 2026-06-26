@@ -79,6 +79,15 @@ jobs:
       FAIL_ON_WARNINGS: ${{ inputs.fail_on_warnings == true && 'true' || 'false' }}
 
     steps:
+      - name: Show schedule timing
+        shell: bash
+        run: |
+          echo "event_name=${{ github.event_name }}"
+          echo "event_schedule=${{ github.event.schedule }}"
+          echo "github_ref=${{ github.ref }}"
+          echo "github_run_id=${{ github.run_id }}"
+          echo "actual_utc_now=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
       - name: Show nightly inputs
         shell: bash
         run: |
