@@ -1,0 +1,41 @@
+[package]
+name = "gpui-component-story-web"
+version = "0.5.1"
+publish = false
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+gpui-component = { path = "../gpui_component", default-features = false }
+gpui-component-assets.workspace = true
+gpui-component-story = { path = "../gpui_component_story", default-features = false }
+# Web specific dependencies
+console_error_panic_hook = "0.1"
+log.workspace = true
+tracing-wasm = "0.2"
+console_log = "1.0"
+wasm-bindgen = { workspace = true }
+gpui = { package = "gpui_facade", path = "../gpui_facade", default-features = false, features = ["gpui_macros"] }
+
+[lints]
+workspace = true
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+gpui = { package = "gpui_facade", path = "../gpui_facade", default-features = false, features = ["gpui_web"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui = { package = "gpui_facade", path = "../gpui_facade", default-features = false, features = ["gpui_macos", "font-kit", "runtime_shaders"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+gpui = { package = "gpui_facade", path = "../gpui_facade", default-features = false, features = ["gpui_linux", "x11", "wayland", "font-kit", "runtime_shaders"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+gpui = { package = "gpui_facade", path = "../gpui_facade", default-features = false, features = ["gpui_windows", "font-kit", "runtime_shaders", "windows-manifest"] }
+
+[features]
+test-support = ["gpui/test-support"]
+
+[dev-dependencies]
+gpui = { package = "gpui_facade", path = "../gpui_facade", default-features = false, features = ["gpui_macros", "test-support"] }
