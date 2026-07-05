@@ -338,7 +338,6 @@ env:
     # crates/util/ <for http_client>
 
   REQUIRED_CRATE_PATHS: |
-    crates/collections
     crates/gpui
     crates/gpui_facade
     crates/gpui_linux
@@ -351,18 +350,6 @@ env:
     crates/gpui_web
     crates/gpui_wgpu
     crates/gpui_windows
-    crates/http_client
-    crates/http_client_tls
-    crates/media
-    crates/refineable
-    crates/reqwest_client
-    crates/scheduler
-    crates/sum_tree
-    crates/util
-    crates/util_macros
-    crates/zlog
-    crates/ztracing
-    crates/ztracing_macro
 
   FILE__CRATES_GPUI_FACADE_CARGO_TOML: |
     {{GPUI_PACKAGE_METADATA}}
