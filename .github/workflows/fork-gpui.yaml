@@ -337,6 +337,33 @@ env:
     # crates/http_client_tls/ <for reqwest_client>
     # crates/util/ <for http_client>
 
+  REQUIRED_CRATE_PATHS: |
+    crates/collections
+    crates/gpui
+    crates/gpui_facade
+    crates/gpui_linux
+    crates/gpui_macos
+    crates/gpui_macros
+    crates/gpui_platform
+    crates/gpui_shared_string
+    crates/gpui_tokio
+    crates/gpui_util
+    crates/gpui_web
+    crates/gpui_wgpu
+    crates/gpui_windows
+    crates/http_client
+    crates/http_client_tls
+    crates/media
+    crates/refineable
+    crates/reqwest_client
+    crates/scheduler
+    crates/sum_tree
+    crates/util
+    crates/util_macros
+    crates/zlog
+    crates/ztracing
+    crates/ztracing_macro
+
   FILE__CRATES_GPUI_FACADE_CARGO_TOML: |
     {{GPUI_PACKAGE_METADATA}}
 
@@ -879,6 +906,139 @@ jobs:
             done <<< "${EXCLUDE_PATTERNS}"
 
             find . -depth -type d -empty -not -path './.git/*' -delete
+          }
+
+          remove_unneeded_crates() {
+            echo "Removing crates outside the required local dependency closure"
+
+            cd "$OUT_DIR"
+
+            python3 - <<'PY'
+          from collections import deque
+          from pathlib import Path
+          import os
+          import shutil
+          import tomllib
+
+          root = Path.cwd().resolve()
+          crates_dir = root / "crates"
+          dependency_sections = ("dependencies", "dev-dependencies", "build-dependencies")
+
+          def read_toml(path: Path) -> dict:
+              with path.open("rb") as file:
+                  return tomllib.load(file)
+
+          def crate_root(path: Path) -> Path | None:
+              try:
+                  relative = path.resolve().relative_to(crates_dir)
+              except ValueError:
+                  return None
+
+              if not relative.parts:
+                  return None
+
+              return crates_dir / relative.parts[0]
+
+          def dependency_tables(data: dict):
+              for section in dependency_sections:
+                  table = data.get(section)
+                  if isinstance(table, dict):
+                      yield table
+
+              targets = data.get("target")
+              if not isinstance(targets, dict):
+                  return
+
+              for target in targets.values():
+                  if not isinstance(target, dict):
+                      continue
+                  for section in dependency_sections:
+                      table = target.get(section)
+                      if isinstance(table, dict):
+                          yield table
+
+          root_data = read_toml(root / "Cargo.toml")
+          workspace_dependencies = root_data.get("workspace", {}).get("dependencies", {})
+          if not isinstance(workspace_dependencies, dict):
+              workspace_dependencies = {}
+
+          required = []
+          unavailable = []
+          for raw in os.environ.get("REQUIRED_CRATE_PATHS", "").splitlines():
+              relative = raw.strip().rstrip("/")
+              if not relative or relative.startswith("#"):
+                  continue
+
+              path = (root / relative).resolve()
+              if (path / "Cargo.toml").is_file():
+                  required.append(path)
+              else:
+                  unavailable.append(relative)
+
+          keep = set(required)
+          pending = deque(required)
+
+          while pending:
+              package_dir = pending.popleft()
+              manifest = package_dir / "Cargo.toml"
+              data = read_toml(manifest)
+
+              for table in dependency_tables(data):
+                  for name, value in table.items():
+                      dependency = value
+                      base = package_dir
+
+                      if isinstance(value, dict) and value.get("workspace") is True:
+                          dependency = workspace_dependencies.get(name)
+                          base = root
+
+                      if not isinstance(dependency, dict):
+                          continue
+
+                      relative_path = dependency.get("path")
+                      if not isinstance(relative_path, str):
+                          continue
+
+                      dependency_root = crate_root(base / relative_path)
+                      if dependency_root is None or dependency_root in keep:
+                          continue
+                      if not (dependency_root / "Cargo.toml").is_file():
+                          continue
+
+                      keep.add(dependency_root)
+                      pending.append(dependency_root)
+
+          discovered = sorted(
+              path.resolve()
+              for path in crates_dir.iterdir()
+              if path.is_dir() and (path / "Cargo.toml").is_file()
+          )
+          removed = [path for path in discovered if path not in keep]
+
+          print("Required crate roots available:")
+          for path in sorted(required):
+              print(f"  - {path.relative_to(root)}")
+          if unavailable:
+              print("Required crate roots not available in this upstream checkout:")
+              for path in sorted(unavailable):
+                  print(f"  - {path}")
+
+          dependency_only = sorted(keep - set(required))
+          print("Additional local dependency crate roots retained:")
+          if dependency_only:
+              for path in dependency_only:
+                  print(f"  - {path.relative_to(root)}")
+          else:
+              print("  - none")
+
+          print("Unneeded crate roots removed:")
+          if removed:
+              for path in removed:
+                  print(f"  - {path.relative_to(root)}")
+                  shutil.rmtree(path)
+          else:
+              print("  - none")
+          PY
           }
 
           generate_gpui_facade_cargo_toml() {
@@ -2483,6 +2643,9 @@ jobs:
 
           CURRENT_STAGE="remove materialized exclusions"
           remove_materialized_exclusions "$OUT_DIR"
+
+          CURRENT_STAGE="remove crates outside required dependency closure"
+          remove_unneeded_crates
 
           CURRENT_STAGE="rename root README files"
           rename_original_root_readmes
