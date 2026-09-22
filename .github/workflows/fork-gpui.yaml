@@ -371,6 +371,7 @@ env:
         "gpui_windows?/test-support",
     ]
 
+    bench-support = ["gpui/bench-support"]
     bench = ["gpui/bench"]
     inspector = ["gpui/inspector", "gpui_macros/inspector"]
     leak-detection = ["gpui/leak-detection"]
@@ -387,8 +388,8 @@ env:
     ]
 
     windows-manifest = ["gpui/windows-manifest"]
-    input-latency-histogram = ["gpui/input-latency-histogram"]
     profiler = ["gpui/profiler"]
+    stacker = ["gpui/stacker"]
 
     font-kit = ["gpui_platform/font-kit", "gpui_macos?/font-kit"]
     runtime_shaders = ["gpui_platform/runtime_shaders", "gpui_macos?/runtime_shaders"]
