@@ -387,7 +387,6 @@ env:
     ]
 
     windows-manifest = ["gpui/windows-manifest"]
-    input-latency-histogram = ["gpui/input-latency-histogram"]
     profiler = ["gpui/profiler"]
 
     font-kit = ["gpui_platform/font-kit", "gpui_macos?/font-kit"]
